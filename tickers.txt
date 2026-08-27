@@ -1,0 +1,43 @@
+# The ticker universe for Project #1.
+#
+# One symbol per line. Blank lines and lines starting with # are ignored.
+# 25 large-cap US names spread across sectors, so the dashboard in step 12
+# has something to compare rather than 25 versions of the same tech trade.
+#
+# Cost of this list: 25 API calls per run at 5 calls/min = ~5 minutes.
+# Add names freely, but every 5 you add is another minute per run.
+
+# --- Technology ---
+AAPL
+MSFT
+NVDA
+GOOGL
+AMZN
+META
+AVGO
+ORCL
+
+# --- Financials ---
+JPM
+BAC
+GS
+V
+
+# --- Healthcare ---
+JNJ
+UNH
+LLY
+PFE
+
+# --- Consumer ---
+WMT
+COST
+PG
+KO
+MCD
+NKE
+
+# --- Energy & Industrials ---
+XOM
+CVX
+CAT

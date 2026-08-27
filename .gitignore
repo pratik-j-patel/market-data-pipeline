@@ -1,0 +1,26 @@
+# Secrets — never commit these
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Data pulled from the API (regenerable — keep the repo small)
+data/
+
+# OS
+.DS_Store
+
+# Credential registers / account notes — never commit, even without secrets in them
+*Credentials*
+*credentials*
+secrets*
+
+# Personal build scaffolding — task lists written for my own use, not part of
+# the project a reader needs. Kept on disk, deliberately out of the repo.
+STEP_*_CHECKLIST.md
