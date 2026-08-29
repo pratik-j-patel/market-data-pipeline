@@ -1,10 +1,12 @@
 # Direct dependencies only. Everything else this project imports is in the
 # Python standard library (json, os, sys, time, argparse, pathlib, datetime,
-# zoneinfo). Install with:  pip install -r requirements.txt
+# zoneinfo, hashlib). Install with:  pip install -r requirements.txt
 #
 # Deliberately NOT a `pip freeze` dump: freeze also lists transitive
-# dependencies (certifi, charset-normalizer, idna, urllib3 all arrive with
-# requests), which buries the two packages that actually matter.
+# dependencies (certifi, charset-normalizer, idna, urllib3 arrive with
+# requests; botocore, jmespath, s3transfer, python-dateutil arrive with
+# boto3), which buries the three packages that actually matter.
 
 requests==2.34.2
 python-dotenv==1.2.3
+boto3==1.43.83
