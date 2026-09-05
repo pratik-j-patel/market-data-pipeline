@@ -24,3 +24,24 @@ secrets*
 # Personal build scaffolding — task lists written for my own use, not part of
 # the project a reader needs. Kept on disk, deliberately out of the repo.
 STEP_*_CHECKLIST.md
+
+# dbt generated output. target/ holds the compiled SQL and the run artifacts,
+# logs/ the run log, dbt_packages/ downloaded packages. All rebuilt by `dbt run`
+# and all reproducible from the models, so none of it belongs in a commit.
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+
+# Connection details. dbt reads these from ~/.dbt/profiles.yml, outside this
+# repo, and scripts/set_dbt_profile.sh is what writes them. This line exists so
+# that a copy accidentally dropped in the project folder still cannot be staged.
+profiles.yml
+
+# Private keys. The Snowflake key pair lives in ~/.snowflake/, outside this
+# repo, so these patterns should never match anything. They exist so that a key
+# generated into the project folder by mistake still cannot be staged.
+*.p8
+*.pem
+*.key
+id_rsa*
+rsa_key*

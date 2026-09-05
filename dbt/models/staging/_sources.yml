@@ -1,0 +1,50 @@
+# =============================================================================
+# Sources: tables dbt reads but did not build.
+#
+# raw_prices was created by sql/06_snowflake_raw_load.sql and is filled by
+# COPY INTO from S3. dbt has no hand in that, so it cannot be a model. Declaring
+# it as a source instead does two things worth having:
+#
+#   1. Models refer to it as {{ source('raw', 'raw_prices') }} rather than by a
+#      hardcoded three-part name. The database and schema are written down once,
+#      here, and dbt renders the rest. Point this file at a different schema and
+#      every model follows.
+#   2. It gives dbt a node for the raw table, so the lineage graph starts at S3
+#      instead of starting mid-pipeline, and so the freshness checks in step 11
+#      have something to attach to.
+# =============================================================================
+
+version: 2
+
+sources:
+  - name: raw
+    database: market_data
+    schema: raw
+    description: >
+      Landing zone. One row per line of one .jsonl file in
+      s3://<bucket>/raw/prices/, loaded by COPY INTO. Nothing here is cast,
+      renamed or filtered -- it is a faithful copy of what is in S3.
+
+    tables:
+      - name: raw_prices
+        description: >
+          Daily equity bars as delivered by the Polygon/Massive API, one
+          untouched JSON object per row, plus three file-level lineage columns.
+        columns:
+          - name: payload
+            description: >
+              The API's JSON object, VARIANT, uncast. Ten fields: ticker,
+              trade_date, open, high, low, close, volume, vwap, transactions,
+              ingested_at_utc.
+          - name: source_file
+            description: Which S3 object this row came from (METADATA$FILENAME).
+          - name: file_row_number
+            description: Which line of that object (METADATA$FILE_ROW_NUMBER).
+          - name: loaded_at
+            description: >
+              When COPY INTO wrote the row, UTC, from SYSDATE(). Deliberately
+              not CURRENT_TIMESTAMP(), which would follow the session timezone.
+
+        # Freshness thresholds and tests are step 11, not step 7. The columns
+        # they need -- loaded_at, source_file, file_row_number -- are carried
+        # through to staging so they are there when that step arrives.

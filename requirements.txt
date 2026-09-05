@@ -10,3 +10,37 @@
 requests==2.34.2
 python-dotenv==1.2.3
 boto3==1.43.83
+
+# dbt-snowflake pulls dbt-core and the Snowflake connector with it -- listing
+# only the adapter is the same reasoning as the note above: the transitive
+# packages are real but they are not the ones a reader needs to see.
+#
+# 1.12.0 is not just "the latest". dbt Core had no Python 3.13 support before
+# 1.11, and this project's venv is 3.13.3, so anything on the 1.10 line or below
+# fails at install.
+dbt-snowflake==1.12.0
+
+# The next two ARE transitive dependencies, pinned by hand anyway. Leaving them
+# to pip breaks the install on macOS, and the reason is worth writing down.
+#
+# dbt-core 1.12.3 requires dbt-core-experimental-parser >= 2.0.0b1. The only
+# release satisfying that is 2.0.0rc1, and it publishes no macOS wheel -- so pip
+# falls back to the source archive, whose build step downloads a prebuilt wheel
+# from GitHub at install time. That download uses plain urllib rather than pip's
+# own HTTP stack, and python.org's Python ships without a CA bundle, so it dies
+# on a certificate error that reads like a network fault and is not one.
+#
+# dbt-core 1.12.0 accepts 2.0.0a4, which does publish a macOS arm64 wheel. With
+# both pinned, every package here installs from a PyPI wheel: nothing is built
+# from source and nothing is fetched from outside PyPI. That property matters
+# again later, when step 10 has to install this unattended.
+dbt-core==1.12.0
+dbt-core-experimental-parser==2.0.0a4
+
+# KNOWN CONSEQUENCE, not a mistake: dbt-snowflake caps certifi below 2025.4.26,
+# so installing it downgrades certifi if a newer one is present. certifi is the
+# list of certificate authorities `requests` trusts, so this touches the API
+# calls in fetch_tickers.py. It does NOT touch the S3 uploads -- botocore
+# carries its own CA list and ignores certifi. Smoke-test the ingestion path
+# after installing rather than assuming it is fine; the command is in
+# docs/dbt_setup.md section 1.

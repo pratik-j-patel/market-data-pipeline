@@ -1,0 +1,54 @@
+# =============================================================================
+# dbt project config.
+#
+# dbt turns a folder of SELECT statements into tables in the warehouse. Each
+# .sql file under models/ is one SELECT; `dbt run` wraps each one in a CREATE
+# TABLE AS and executes it in dependency order. That is the whole idea -- SQL
+# I already know, plus somewhere to put it and something to run it.
+#
+# This file is the project's identity: what it is called, where its pieces
+# live, and the defaults every model inherits. Connection details are NOT here.
+# They live in ~/.dbt/profiles.yml, outside this repository, which is what
+# keeps a Snowflake password off disk anywhere git can see it.
+# =============================================================================
+
+name: 'market_data'
+version: '1.0.0'
+config-version: 2
+
+# Which block in ~/.dbt/profiles.yml to connect with. The name has to match on
+# both sides; a mismatch is the single most common "dbt debug" failure.
+profile: 'market_data'
+
+# Pinned because Python 3.13 needs dbt Core 1.11 or newer -- 1.10 and earlier
+# have no 3.13 support at all. Stating it here means a wrong version fails with
+# a sentence about versions instead of an import error forty frames deep.
+require-dbt-version: [">=1.11.0", "<2.0.0"]
+
+model-paths:    ["models"]
+macro-paths:    ["macros"]
+test-paths:     ["tests"]
+seed-paths:     ["seeds"]
+snapshot-paths: ["snapshots"]
+
+# Everything dbt generates. `dbt clean` deletes these; .gitignore keeps them
+# out of commits. Nothing in here is worth version-controlling -- it is all
+# rebuilt from the models on every run.
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  market_data:
+    staging:
+      # A real table, not a view.
+      #
+      # The dbt convention for a staging layer is a view: it costs no storage
+      # and it is never stale. I am choosing a table anyway, for three reasons.
+      # The step's own definition of done is "builds one clean table". At
+      # 12,529 rows the storage is a rounding error -- kilobytes. And the
+      # Streamlit dashboard in step 12 queries this object directly, where
+      # reading stored rows beats re-running the casts on every page load.
+      #
+      # If that calculus changes, it is one word.
+      +materialized: table

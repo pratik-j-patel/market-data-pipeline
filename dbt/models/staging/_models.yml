@@ -1,0 +1,45 @@
+# =============================================================================
+# What the staging model produces.
+#
+# Descriptions only. The tests -- uniqueness, not-null, freshness -- are step
+# 11 and are deliberately not here yet; adding them now would spend a later
+# step's hours and give this one more ways to fail.
+# =============================================================================
+
+version: 2
+
+models:
+  - name: stg_prices
+    description: >
+      Daily equity bars, typed. One row per ticker per trading day, every price
+      and volume column cast explicitly rather than inferred. Carries the raw
+      table's lineage columns through unchanged.
+    columns:
+      - name: price_key
+        description: ticker and trade_date joined -- the grain as a single column.
+      - name: ticker
+        description: Exchange symbol, e.g. AAPL.
+      - name: trade_date
+        description: The session this bar covers. Never today's date -- a day's close is not published until overnight.
+      - name: open
+        description: First traded price of the session. FLOAT by hand.
+      - name: high
+        description: Highest traded price of the session. FLOAT by hand.
+      - name: low
+        description: Lowest traded price of the session. FLOAT by hand.
+      - name: close
+        description: Last traded price of the session. FLOAT by hand -- this is the column AAPL's 229 lives in.
+      - name: volume
+        description: Shares traded. FLOAT, not INTEGER -- 26% of values arrive fractional.
+      - name: vwap
+        description: Volume-weighted average price for the session.
+      - name: transaction_count
+        description: Number of individual trades in the session.
+      - name: ingested_at_utc
+        description: When the API produced the row, UTC, zone dropped.
+      - name: source_file
+        description: The S3 object this row was loaded from.
+      - name: file_row_number
+        description: The line within that object.
+      - name: loaded_at
+        description: When COPY INTO wrote the row into raw, UTC.
