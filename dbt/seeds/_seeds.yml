@@ -1,0 +1,50 @@
+# =============================================================================
+# Seeds: reference data that lives in this repository, not in a source system.
+#
+# `dbt seed` reads each .csv under seeds/ and loads it into the warehouse as a
+# table. That makes it the right home for facts that no API supplies and that
+# change by human decision rather than by a daily job -- here, which company a
+# symbol belongs to and which sector that company is in.
+#
+# Why a seed rather than the alternatives:
+#
+#   * Not parsed out of tickers.txt. That file's "# --- Technology ---" lines
+#     are comments, documentation for a human reading the list. Parsing them
+#     would make a cosmetic line load-bearing, and the next person to tidy the
+#     file would break the pipeline without touching a single line of code.
+#
+#   * Not hardcoded as a VALUES block inside dim_tickers.sql. Twenty-five rows
+#     of data wedged into a SELECT is data pretending to be logic. In a seed it
+#     shows up in a diff as a data change, which is what it is.
+#
+# Where it lands: the default schema, `staging`, alongside stg_prices. This is
+# an input to the marts layer, not a mart, and it needs no cleaning step of its
+# own because it is maintained by hand and reviewed in a pull request.
+#
+# ⚠️ ON SECTORS. These are GICS sectors -- the classification standard that
+# financial data actually uses. They differ from the informal groupings in the
+# comments of tickers.txt in three places: GOOGL and META are Communication
+# Services rather than Technology, and AMZN is Consumer Discretionary. The
+# everyday grouping is not wrong so much as it is a different question. A chart
+# labelled "Technology" should mean what a finance reader thinks it means, so
+# the standard wins here and this file is the authority.
+# =============================================================================
+
+version: 2
+
+seeds:
+  - name: ticker_reference
+    description: >
+      One row per ticker in the universe: the symbol, the company's name, and
+      its GICS sector. Maintained by hand. Adding a ticker here and to
+      tickers.txt is the whole process for widening the universe.
+    columns:
+      - name: ticker
+        description: Exchange symbol. The natural key, and the join key into stg_prices.
+      - name: company_name
+        description: >
+          Company name as it should be displayed. Four of these contain a
+          comma, so the CSV quotes them -- a reminder that a comma-separated
+          file is not the same thing as a file split on commas.
+      - name: sector
+        description: GICS sector. Eight distinct values across the 25 tickers.

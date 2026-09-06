@@ -32,6 +32,15 @@ dbt/target/
 dbt/logs/
 dbt/dbt_packages/
 
+# The same three, unanchored. dbt writes them relative to the directory it was
+# invoked from, so running a dbt command from the repository root -- easy to do,
+# and it fails with a "no dbt_project.yml found" error only AFTER creating logs/
+# -- drops them here instead of under dbt/. Without these lines that stray log
+# is untracked but stageable, and `git add .` would commit it.
+logs/
+target/
+dbt_packages/
+
 # Connection details. dbt reads these from ~/.dbt/profiles.yml, outside this
 # repo, and scripts/set_dbt_profile.sh is what writes them. This line exists so
 # that a copy accidentally dropped in the project folder still cannot be staged.

@@ -1,0 +1,110 @@
+# =============================================================================
+# The marts layer.
+#
+# staging answers "is this data clean and correctly typed?". marts answers
+# "what shape does this need to be in for someone to ask a question of it?".
+# Those are different jobs and they are deliberately different folders, built
+# into different schemas.
+#
+# Descriptions only, again. Tests are step 11.
+# =============================================================================
+
+version: 2
+
+models:
+  - name: dim_tickers
+    description: >
+      One row per ticker: what the symbol is, who it belongs to, what sector it
+      trades in, and how much price history the warehouse holds for it. Joins
+      to any fact table on ticker. Type 1 -- an attribute change overwrites the
+      row and no history is kept, which is honest for 25 large-caps whose
+      sectors do not move.
+    columns:
+      - name: ticker
+        description: >
+          Exchange symbol. The grain and the natural key -- unique, stable, and
+          used directly rather than behind a surrogate integer.
+      - name: company_name
+        description: >
+          Display name from the seed. NULL means this ticker has price history
+          but is missing from seeds/ticker_reference.csv -- a real gap, left
+          visible on purpose.
+      - name: sector
+        description: >
+          GICS sector from the seed. Eight distinct values. NULL carries the
+          same meaning as a NULL company_name.
+      - name: first_trade_date
+        description: Earliest session the warehouse holds for this ticker.
+      - name: last_trade_date
+        description: Latest session the warehouse holds for this ticker.
+      - name: trading_days
+        description: >
+          Distinct sessions held. 503 is the full window; anything less is
+          genuinely absent upstream, not dropped by this pipeline.
+      - name: price_rows
+        description: >
+          Rows in stg_prices for this ticker. Should equal trading_days.
+          If it does not, stg_prices holds a duplicate -- which is exactly what
+          the staging layer declines to hide.
+
+  - name: fct_daily_prices
+    description: >
+      One row per ticker per trading day: the session as traded, plus the five
+      derived measures a price dashboard needs and the API does not send. Joins
+      to dim_tickers on ticker. Carries no company or sector columns of its own,
+      deliberately -- one join is cheaper than a sector correction that has to be
+      made in two places.
+    columns:
+      - name: price_key
+        description: >
+          ticker and trade_date joined. The grain as one column, carried through
+          from staging so step 11's uniqueness test has a single column to work on.
+      - name: ticker
+        description: Exchange symbol. The join key into dim_tickers.
+      - name: trade_date
+        description: The session this row covers.
+      - name: open
+        description: First traded price of the session.
+      - name: high
+        description: Highest traded price of the session.
+      - name: low
+        description: Lowest traded price of the session.
+      - name: close
+        description: Last traded price of the session.
+      - name: volume
+        description: Shares traded. FLOAT, because 26% of values arrive fractional.
+      - name: vwap
+        description: Volume-weighted average price for the session.
+      - name: transaction_count
+        description: Number of individual trades in the session.
+      - name: prior_close
+        description: >
+          The previous session's close for the same ticker. NULL on each ticker's
+          first row -- correct, not missing: there is no earlier session to name.
+      - name: daily_return_pct
+        description: >
+          Percent change from prior_close. NULL wherever prior_close is NULL, and
+          deliberately not coalesced to zero -- "nothing to compare against" and
+          "did not move" are different claims. Unrounded; rounding is the
+          dashboard's decision.
+      - name: moving_avg_20d
+        description: >
+          Mean close over the trailing 20 trading sessions. NULL until 20 sessions
+          exist for that ticker, rather than averaging however many are available
+          and calling the result a 20-day average.
+      - name: high_52w
+        description: >
+          Highest high over the trailing 252 sessions -- the conventional trading
+          year. NULL until 252 sessions exist, which is roughly the first half of
+          each ticker's history in this two-year dataset.
+      - name: low_52w
+        description: Lowest low over the same trailing 252 sessions, same NULL rule.
+      - name: dollar_volume
+        description: >
+          Notional traded: vwap x volume, falling back to close x volume where the
+          API omits vwap. The closest available measure of value changing hands.
+      - name: loaded_at
+        description: >
+          When COPY INTO wrote the underlying raw row, UTC. Carried so a dashboard
+          can show "data as of" and so step 11 can test freshness here without
+          reaching back through staging.

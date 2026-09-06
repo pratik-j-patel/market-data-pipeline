@@ -35,13 +35,17 @@ flowchart TD
     S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>503 partitions</i>"]
     RAW["Snowflake <code>raw.raw_prices</code><br/><i>one VARIANT column, uncast</i>"]
     STG["Snowflake <code>staging.stg_prices</code><br/><i>12,529 typed rows</i>"]
+    SEED["<code>dbt/seeds/ticker_reference.csv</code><br/><i>25 rows · company name + GICS sector</i>"]
+    MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 + 12,529 rows</i>"]
     DASH["Streamlit dashboard<br/><i>not built yet — step 12</i>"]
 
     API -->|"<b>fetch_tickers.py</b><br/>trailing window · merge on (trade_date, ticker)"| LOCAL
     LOCAL -->|"<b>upload_to_s3.py</b><br/>skip when local MD5 == S3 ETag"| S3
     S3 -->|"<b>COPY INTO</b><br/>keyless storage integration"| RAW
     RAW -->|"<b>dbt run</b><br/>hand-written type casts"| STG
-    STG -.-> DASH
+    STG -->|"<b>dbt run</b><br/>window functions, partitioned by ticker"| MARTS
+    SEED -->|"<b>dbt seed</b><br/>the one thing the API cannot send"| MARTS
+    MARTS -.-> DASH
 ```
 
 Nothing schedules this yet — I run it by hand. Putting it behind an orchestrator is step 10,
@@ -53,15 +57,18 @@ and the pipeline was built to make that step boring: every stage is already safe
 
 | | |
 |---|---|
-| Tickers | 25 large-caps across 5 sectors (`tickers.txt`) |
+| Tickers | 25 large-caps across 8 GICS sectors (`tickers.txt`; names and sectors in `dbt/seeds/ticker_reference.csv`) |
 | Trading days | 503 — 2024-08-26 through 2026-08-27 |
 | Rows | 12,529 in `raw.raw_prices`, 12,529 in `staging.stg_prices` |
 | Distinct `(ticker, trade_date)` | 12,529 |
+| Marts | `marts.dim_tickers` 25 rows · `marts.fct_daily_prices` 12,529 rows |
 | `COPY INTO` | 503/503 files loaded, 0 errors, 6.1s |
 | Re-run of the same `COPY INTO` | `Copy executed with 0 files processed.` |
 
-12,529 rather than 503 × 25 = 12,575: a handful of ticker-days are genuinely absent upstream.
-The staging model does not paper over that, deliberately — see *No deduplication* below.
+12,529 rather than 503 × 25 = 12,575. The gap is not missing data: two of those 503 dates come
+from smoke-test runs rather than a full pass — 2026-08-26 holds three tickers, 2026-08-27 holds
+one. The remaining 501 dates are complete for all 25. I had assumed the rows were absent
+upstream until a count per date said otherwise.
 
 ---
 
@@ -157,6 +164,51 @@ step 12 reads this object on every page load. If that calculus changes it is one
 starts at S3 rather than at the staging model, and the freshness tests in step 11 have a node to
 attach to.
 
+**The marts layer is a star, and its key is the ticker symbol.** `dim_tickers` says what a symbol
+*is* — company, sector, how much history the warehouse holds for it. `fct_daily_prices` says what
+*happened* — one row per ticker per trading day, with the derived measures a chart needs and the
+API does not send. Kimball's textbook answer would give the dimension a surrogate integer key; I
+used the symbol. Surrogate keys mainly exist to serve Type 2 slowly-changing dimensions, where one
+real ticker needs several rows and the natural key stops being unique. This dimension is Type 1 —
+25 large-caps whose sectors do not move — so the symbol is still unique, stable and readable, and
+a surrogate would buy a join hop and a package dependency. A Type 2 snapshot over data that never
+changes would demonstrate the pattern without testing it.
+
+**Every window partitions by ticker, and that is load-bearing.** Without `partition by ticker`
+these functions walk one stream of 12,529 rows ordered by date, where the row before any given
+AAPL row is a different company on the same day. I measured that rather than assuming it: computing
+`prior_close` both ways, **12,526 of the 12,529 rows disagree**. The three that agree are the first
+row of the table, where both versions are null, and two coincidences where two companies closed at
+the same price on adjacent rows. No error, no warning — a column of numbers that are almost all
+wrong and all look reasonable. The check for it is cheap and binary: `prior_close` must be null on
+exactly **25** rows, one per ticker. Drop the partition and it is null on one.
+
+**A partial window is not a smaller answer to the same question.** `moving_avg_20d` is null for
+each ticker's first nineteen rows rather than averaging however many days happen to exist. Without
+that guard, row five reports the mean of five days in a column named for twenty, and nothing about
+it looks wrong — AAPL's nineteenth row would have read `223.5332`, a perfectly reasonable-looking
+number. The same rule governs the rolling 52-week high and low, which need 252 sessions and are
+therefore null across roughly half of this two-year dataset. And `rows between 19 preceding`, not
+`range`: twenty *sessions* is what a 20-day average means to anyone reading prices, where `range`
+would count by calendar date and sweep in the weekends.
+
+**Sector lives in a seed, and its types are declared.** No price API sends a company's sector, so
+the 25 symbol/name/sector rows are a CSV in this repository that `dbt seed` loads into the
+warehouse — version-controlled and readable as a diff, rather than parsed out of the comments in
+`tickers.txt`, which would make a cosmetic line load-bearing. The column types are written down in
+`dbt_project.yml` rather than inferred from the file, for the same reason the raw table is
+`VARIANT`. The sectors are GICS, which puts Alphabet and Meta in Communication Services and Amazon
+in Consumer Discretionary. The everyday grouping that calls all three Technology is not wrong; it
+answers a different question than a chart axis labelled with a sector name does.
+
+**dbt appends custom schemas, so the marts layer needed a macro.** Configuring `+schema: marts`
+does not produce a schema called `marts`. dbt's built-in `generate_schema_name` concatenates it
+onto the profile's schema and builds `staging_marts`. That behaviour is deliberate — it stops
+developers on a shared warehouse from overwriting each other — and irrelevant on one laptop.
+Overriding the macro in `dbt/macros/` is the documented fix and runs to ten lines. Staging models
+carry no `+schema:` and are unaffected, which I confirmed by rebuilding them and reading back where
+they landed rather than assuming.
+
 **Partitioned by trade date, from the first line of Python.** `data/date=YYYY-MM-DD/prices.jsonl`
 maps directly onto the S3 prefix and lets one prefix-wide `COPY INTO` load everything. Hive-style
 `date=` folders are also what Snowflake, Spark and Athena expect to read as a partition key. The
@@ -240,11 +292,13 @@ Follow **[docs/dbt_setup.md](docs/dbt_setup.md)**.
 
 ```bash
 bash scripts/set_dbt_profile.sh      # generates the RSA key pair, writes ~/.dbt/profiles.yml
-cd dbt && dbt debug && dbt run
+cd dbt && dbt debug && dbt seed && dbt run
 ```
 
-`dbt debug` before `dbt run`, always — a profile mismatch fails with a sentence about connections
-instead of forty frames of stack trace.
+`dbt debug` before anything, always — a profile mismatch fails with a sentence about connections
+instead of forty frames of stack trace. And `dbt seed` before `dbt run`: `dbt run` does not load
+seeds, and `dim_tickers` reads one, so running the models alone fails on a table that was never
+created.
 
 ---
 
@@ -258,7 +312,7 @@ tickers.txt             The 25-symbol universe. Comments allowed.
 
 sql/                    The Snowflake side: warehouse, storage integration, stage, COPY INTO.
 aws/                    IAM policy and trust policy documents, with the bootstrap version kept.
-dbt/                    dbt project. One source, one staging model, one .yml describing it.
+dbt/                    dbt project: one source, a staging model, a seed, and the marts star.
 docs/                   Runbooks for the two stages that involve a console: Snowflake and dbt.
 notebooks/              How each step was worked out, with outputs kept as evidence.
 scripts/                Credential setup, the secret scanner, and the hook installer.
@@ -277,19 +331,18 @@ back. A 200 means the message arrived, not that the server did what was asked.
 
 In the order I intend to build them:
 
-1. **A marts layer** — tables a dashboard can query with no further joins. The grain gets decided
-   before any SQL is written.
-2. **An orchestrator.** Airflow, replacing manual runs. Every stage is already re-runnable, so
+1. **An orchestrator.** Airflow, replacing manual runs. Every stage is already re-runnable, so
    this step is about scheduling and observability rather than about correctness. It runs in the
    morning and expects yesterday's close, because a day's close is never available on that day.
-3. **dbt tests and source freshness.** `stg_prices` already carries `price_key`, `source_file`,
+2. **dbt tests and source freshness.** `stg_prices` already carries `price_key`, `source_file`,
    `file_row_number` and `loaded_at` for exactly this: uniqueness and not-null on the first,
    freshness on the last. The measure of success is breaking a source on purpose and having the
    run fail loudly.
-4. **A Streamlit dashboard**, reading `stg_prices` directly.
+3. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
+   `ticker` — which is the whole reason those two tables exist.
 
-Things I know are missing and have not pretended otherwise: there are no automated tests yet,
-nothing runs on a schedule, and the marts layer does not exist. Each has a place in the list above.
+Things I know are missing and have not pretended otherwise: there are no automated tests yet, and
+nothing runs on a schedule. Each has a place in the list above.
 
 ---
 

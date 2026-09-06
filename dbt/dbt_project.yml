@@ -52,3 +52,38 @@ models:
       #
       # If that calculus changes, it is one word.
       +materialized: table
+
+    marts:
+      # Also a table, for the same reasons as staging plus one more: these are
+      # the objects the Streamlit dashboard reads, and a view here would push
+      # the joins and the window functions into every page load.
+      +materialized: table
+
+      # Built into their own schema, market_data.marts.
+      #
+      # This line is the one that needs macros/generate_schema_name.sql to be
+      # present. Without that override dbt does not use "marts" -- it appends
+      # it to the profile's schema and builds "staging_marts" instead. Read
+      # that file before changing anything here.
+      +schema: marts
+
+# =============================================================================
+# Seeds: CSV files under seeds/, loaded into the warehouse by `dbt seed`.
+#
+# Types are declared, not inferred. dbt would otherwise guess each column's
+# type from the file's contents, which is the same class of mistake that
+# putting raw JSON in a VARIANT column exists to avoid: a tool looking at a
+# sample and deciding what the data means. A ticker is text even when every
+# symbol in the file happens to look like a word, and a name is text of a
+# length chosen here rather than a length that happens to fit today.
+#
+# No +schema: here, so seeds land in the profile's schema, `staging`. The seed
+# is an input to the marts layer, not a mart.
+# =============================================================================
+seeds:
+  market_data:
+    ticker_reference:
+      +column_types:
+        ticker:       varchar(10)
+        company_name: varchar(120)
+        sector:       varchar(60)
