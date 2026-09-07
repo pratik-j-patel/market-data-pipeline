@@ -30,6 +30,7 @@ This repository is my answer to those four, one file at a time.
 
 ```mermaid
 flowchart TD
+    AF["Airflow DAG <code>market_data_pipeline</code><br/><i>07:00 America/New_York · weekdays · catchup off</i>"]
     API["Massive / Polygon API<br/><i>daily bars · 5 calls/min · free tier</i>"]
     LOCAL["Local partitions<br/><code>data/date=YYYY-MM-DD/prices.jsonl</code>"]
     S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>509 partitions</i>"]
@@ -39,6 +40,7 @@ flowchart TD
     MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 + 12,725 rows</i>"]
     DASH["Streamlit dashboard<br/><i>not built yet — step 12</i>"]
 
+    AF -.->|"four tasks, in order"| API
     API -->|"<b>fetch_tickers.py</b><br/>trailing window · merge on (trade_date, ticker)"| LOCAL
     LOCAL -->|"<b>upload_to_s3.py</b><br/>skip when local MD5 == S3 ETag"| S3
     S3 -->|"<b>COPY INTO</b><br/>keyless storage integration"| RAW
@@ -48,8 +50,11 @@ flowchart TD
     MARTS -.-> DASH
 ```
 
-Nothing schedules this yet — I run it by hand. Putting it behind an orchestrator is step 10,
-and the pipeline was built to make that step boring: every stage is already safe to re-run.
+An Airflow DAG runs those four stages every weekday morning, calling the same scripts a person
+would rather than importing them — so the instructions further down and the scheduled job cannot
+drift apart. The pipeline was built to make that step boring: every stage was already safe to
+re-run before a scheduler existed. It turned out to be less boring than expected, and the
+section after next explains why.
 
 ---
 
@@ -125,6 +130,64 @@ so unchanged bytes now propagate all the way down. `ingested_at_utc` means *firs
 seen to change*; when a row last reached the warehouse is a different question, and
 `raw_prices.loaded_at` answers it. Deduplicating in the staging model would also have made the
 symptom go away, in one line, which is the same objection as the one below.
+
+---
+
+## The orchestrator
+
+`airflow/dags/market_data_pipeline.py` runs the four stages at **07:00 America/New_York, Monday
+to Friday**. Four tasks in a line, each one running a command from the section further down.
+
+**It calls the scripts; it does not import them.** Airflow is a caller, not an owner. So
+`python fetch_tickers.py` on a laptop and the `fetch_prices` task execute byte-identical files,
+and this README cannot quietly stop describing what the scheduler actually does.
+
+**07:00, and it expects yesterday.** A trading day's close is never available on that day: it
+appears somewhere between about 9pm ET that evening and about 11am ET the next morning. A 7am
+run therefore usually has yesterday's close and occasionally does not — which is fine, because
+the trailing window means a late bar is collected by the next morning's run. Waiting until noon
+to guarantee it would trade a self-healing design for a slower one.
+
+**The schedule is named `America/New_York`, not UTC.** Those are the same instant today and
+different instants on 2026-11-01, when the clocks change. The ingestion code already separates
+trading days (ET) from instants (UTC) and the schedule should not undo that. The first scheduled
+run is stored as `2026-09-07T11:00:00+00:00` — 07:00 in New York, converted rather than assumed.
+
+**`catchup=False`, `max_active_runs=1`.** Airflow's default is one run per missed interval since
+the start date, which is correct for a job whose work is a function of its logical date. This one
+is not: every run fetches the same trailing window regardless of when it was meant to happen, so
+ten catch-up runs would do identical work ten times.
+
+**No market calendar.** Weekends are excluded because there is nothing to fetch. Public holidays
+still fire and still find nothing new, which is harmless — the trailing window makes "market
+closed" and "missed run" the same situation. A holiday calendar here would be a dependency whose
+only job is to prevent a no-op.
+
+**Airflow gets its own Python and so does the pipeline.** `airflow/Dockerfile` extends the
+official image with a second virtualenv built from this repository's `requirements.txt`. Airflow
+and dbt pin large, overlapping sets of libraries; installing them together asks pip to satisfy
+two sets of constraints at once and, when it cannot, to resolve to versions neither side chose.
+Separate environments mean neither has to win, and the pins verified on a laptop are the ones
+that run in the container. Nothing in the image is built from source — every pinned package
+publishes a wheel for the image's platform, checked against PyPI before the Dockerfile existed.
+
+**No credential appears in `docker-compose.yaml`.** The repository is bind-mounted, so `.env`
+arrives with it, and `~/.dbt` and `~/.snowflake` are mounted read-only via `${HOME}`, which the
+host expands. The compose file contains no key, no bucket name, and not even a username — which
+is also what keeps `scripts/check_secrets.sh` quiet, since its strongest rule is to grep staged
+content for the literal values in `.env`.
+
+### The bug a green run hid
+
+The first triggered run reported **success in twenty-one milliseconds** and ran no tasks at all.
+Its logical date was 2026-09-07; `start_date` in the DAG was 2026-09-08, set a day ahead so the
+schedule would stay quiet during testing. Airflow created the run, found no task instances to
+create for a date before the DAG was meant to exist, and marked it successful because there was
+nothing left to do.
+
+A red run asks to be looked at. A green run that did nothing does not, and the only tell was a
+duration too short to be real. `start_date` now sits in the past, `catchup=False` keeps that from
+backfilling, and the reason is written where the line is.
 
 ---
 
@@ -358,6 +421,37 @@ Run those four twice in a row and nothing should move: 0 day files rewritten, 0 
 0 files copied. That is the property the section above is about, and it is worth checking rather
 than assuming.
 
+**7. Running it on a schedule**
+
+Needs Docker with at least 4GB of memory available to it — 8GB on macOS, where the default
+allocation is a fraction of the machine and an out-of-memory kill shows up as an exit code 137
+and a truncated log rather than as anything mentioning memory.
+
+```bash
+cd airflow
+curl -LfO 'https://airflow.apache.org/docs/apache-airflow/3.3.1/docker-compose.yaml'  # already committed; only if starting fresh
+mkdir -p ./dags ./logs ./plugins ./config
+echo "AIRFLOW_UID=50000" > .env        # a second .env, holding one line and no secret
+docker compose build                   # extends the Airflow image with this repo's requirements.txt
+docker compose up airflow-init
+docker compose up -d
+```
+
+The UI is at `http://localhost:8080`, `airflow` / `airflow` — a default that is fine on a laptop
+and would not be anywhere else. Unpause `market_data_pipeline` and it runs at 07:00 on weekdays.
+
+Before trusting a DAG, it is worth proving the container can do the work without one:
+
+```bash
+docker compose exec airflow-scheduler bash
+cd /opt/repo && $PIPELINE_PYTHON scripts/snowflake_copy.py --dry-run
+cd /opt/repo && $PIPELINE_PYTHON upload_to_s3.py --dry-run
+cd /opt/repo/dbt && $PIPELINE_DBT debug
+```
+
+Those three exercise the repository mount, the pipeline's virtualenv, `.env`, the AWS keys and
+the Snowflake key pair. If they pass, a failing DAG is a DAG problem; if they fail, it never was.
+
 ---
 
 ## Repository layout
@@ -368,6 +462,7 @@ fetch_tickers.py        The ingestion job: trailing window, rate limiting, retri
 upload_to_s3.py         Partitions to S3, skipping anything whose MD5 already matches the ETag.
 tickers.txt             The 25-symbol universe. Comments allowed.
 
+airflow/                The orchestrator: compose file, the extended image, and the DAG.
 sql/                    The Snowflake side: warehouse, storage integration, stage, COPY INTO.
 aws/                    IAM policy and trust policy documents, with the bootstrap version kept.
 dbt/                    dbt project: one source, a staging model, a seed, and the marts star.
@@ -389,18 +484,21 @@ back. A 200 means the message arrived, not that the server did what was asked.
 
 In the order I intend to build them:
 
-1. **An orchestrator.** Airflow, replacing manual runs. Every stage is already re-runnable, so
-   this step is about scheduling and observability rather than about correctness. It runs in the
-   morning and expects yesterday's close, because a day's close is never available on that day.
-2. **dbt tests and source freshness.** `stg_prices` already carries `price_key`, `source_file`,
+1. **dbt tests and source freshness.** `stg_prices` already carries `price_key`, `source_file`,
    `file_row_number` and `loaded_at` for exactly this: uniqueness and not-null on the first,
    freshness on the last. The measure of success is breaking a source on purpose and having the
-   run fail loudly.
-3. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
+   run fail loudly. One thing I already know: a freshness rule written as "fail if the newest
+   row is more than a day old" would page me every Tuesday after a long weekend. The largest
+   normal lag this pipeline shows is three days — Friday's close, a weekend, and a public
+   holiday — and that is a calendar fact, not a fault.
+2. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
    `ticker` — which is the whole reason those two tables exist.
 
-Things I know are missing and have not pretended otherwise: there are no automated tests yet, and
-nothing runs on a schedule. Each has a place in the list above.
+Things I know are missing and have not pretended otherwise. There are no automated tests yet,
+which is the first item above. And the scheduler runs on my laptop rather than anywhere durable:
+if the machine is asleep at 7am the run simply does not happen. The trailing window is what makes
+that survivable instead of a hole in the data, but it is a laptop, and I would not describe it
+as production.
 
 ---
 

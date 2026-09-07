@@ -1,0 +1,29 @@
+# What Docker must NOT send to the daemon when building airflow/Dockerfile.
+#
+# The build context is this whole directory, and everything in it is copied to
+# the Docker daemon before the first instruction runs -- so an unfiltered
+# context here would ship the local virtualenv and two years of price
+# partitions on every build, to install one requirements.txt.
+#
+# This file has nothing to do with .gitignore. They overlap by coincidence, not
+# by design: .gitignore is about what a reader of the repository should see,
+# this is about what a build needs. data/ is in both for different reasons.
+
+.venv/
+venv/
+data/
+.git/
+.github/
+notebooks/
+airflow/logs/
+airflow/config/
+airflow/plugins/
+airflow/dags/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+STEP_*_CHECKLIST.md
