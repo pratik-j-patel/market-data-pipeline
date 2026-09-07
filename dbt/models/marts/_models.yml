@@ -39,7 +39,7 @@ models:
         description: Latest session the warehouse holds for this ticker.
       - name: trading_days
         description: >
-          Distinct sessions held. 503 is the full window; anything less is
+          Distinct sessions held. 509 is the full window; anything less is
           genuinely absent upstream, not dropped by this pipeline.
       - name: price_rows
         description: >

@@ -2,7 +2,7 @@
 -- dim_tickers -- one row per ticker in the universe.
 --
 -- A dimension table answers "what is this thing?" A fact table answers "what
--- happened?" stg_prices is all fact: 12,529 rows of what happened, and not one
+-- happened?" stg_prices is all fact: 12,725 rows of what happened, and not one
 -- column saying what AAPL *is*. Everything a dashboard needs to group, filter
 -- or label by -- company name, sector -- has to come from somewhere else,
 -- because the price API does not send it. This is that somewhere else.

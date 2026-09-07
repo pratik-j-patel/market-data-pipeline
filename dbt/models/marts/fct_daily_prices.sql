@@ -13,7 +13,7 @@
 -- grain. Widening or rolling up would be a different table, not this one.
 --
 -- Joins to dim_tickers on ticker for company name and sector. Deliberately does
--- NOT carry those columns itself: duplicating a sector across 12,529 rows to
+-- NOT carry those columns itself: duplicating a sector across 12,725 rows to
 -- save one join means a sector correction has to be made in two places, and the
 -- second one gets forgotten.
 -- =============================================================================
@@ -44,12 +44,15 @@ windowed as (
     -- Every window below reads `partition by ticker order by trade_date`, and
     -- both halves are load-bearing.
     --
-    -- PARTITION BY TICKER is not decoration. Without it these functions walk one
-    -- continuous stream of 12,529 rows sorted by date, and at every boundary
-    -- between one ticker and the next they reach across it: AAPL's first close
-    -- would be compared against AMZN's last. No error, no warning, no null --
-    -- just a wrong number on 24 rows, which is exactly the kind of wrong that
-    -- survives review because nothing about it looks broken.
+    -- PARTITION BY TICKER is not decoration. Without it these functions walk
+    -- one continuous stream of every row sorted by date, and at every boundary
+    -- between one ticker and the next they reach across it: AAPL's close would
+    -- be compared against whichever company happens to sort next on the same
+    -- day. No error, no warning, no null -- just a column of numbers that are
+    -- almost all wrong and all look reasonable, which is exactly the kind of
+    -- wrong that survives review. Measured rather than assumed: computing
+    -- prior_close both ways over the 12,529 rows the table held at the time,
+    -- 12,526 of them disagree.
     --
     -- ROWS, not RANGE. `rows between 19 preceding` counts twenty ROWS, which
     -- here means twenty trading sessions -- and twenty sessions is what "20-day

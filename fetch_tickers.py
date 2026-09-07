@@ -122,17 +122,48 @@ def day_file(trade_date: str) -> Path:
     return DATA_DIR / f"date={trade_date}" / "prices.jsonl"
 
 
-def write_day_files(rows: list) -> int:
+def same_bar(old: dict, new: dict) -> bool:
+    """True when two rows describe the same bar, ignoring when it was fetched.
+
+    Compared over the UNION of both key sets, so a field added to bar_to_row
+    later counts as a difference rather than being silently ignored.
+    """
+    fields = (set(old) | set(new)) - {"ingested_at_utc"}
+    return all(old.get(f) == new.get(f) for f in fields)
+
+
+def write_day_files(rows: list) -> tuple:
     # Group by trade date, then MERGE each day file on (trade_date, ticker).
     #
     # Why merge rather than overwrite: if NVDA failed this run, its rows are not
     # in `rows`. A blind overwrite would delete NVDA's perfectly good history from
     # every day file it touches -- a failure would destroy data. Merging replaces
     # only the tickers that succeeded and leaves the rest alone.
+    #
+    # WHY AN UNCHANGED ROW KEEPS ITS ORIGINAL ingested_at_utc
+    #
+    # This used to re-stamp every row on every run, so the stamp meant "when we
+    # last saw this row". Measured on 2026-09-07, that cost more than it bought.
+    # A trailing window re-fetches days whose prices settled weeks ago. Re-
+    # stamping them changed the file's bytes; changed bytes no longer match the
+    # object's S3 ETag, so upload_to_s3.py re-uploaded the file; and Snowflake's
+    # COPY skips a staged file only when it was loaded before AND has not
+    # changed since -- so it loaded the whole file a second time.
+    #
+    # The run that found it: 10 day files touched, 10 re-uploaded, 10 re-copied,
+    # 250 rows added, of which 54 were duplicates. Twenty-five of those came
+    # from a single date that had gained no new data at all. Every one of the
+    # three idempotency layers was behaving exactly as measured in isolation.
+    # The composition was not, and only an end-to-end re-run could show it.
+    #
+    # So a row is replaced only when the bar itself differs. The stamp now means
+    # "first seen, or last seen to change". When a row last reached the
+    # warehouse is a different question, and raw_prices.loaded_at answers it.
     by_date = {}
     for row in rows:
         by_date.setdefault(row["trade_date"], []).append(row)
 
+    rewritten = 0
     for trade_date, new_rows in sorted(by_date.items()):
         path = day_file(trade_date)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,17 +176,27 @@ def write_day_files(rows: list) -> int:
                     merged[old["ticker"]] = old
 
         for row in new_rows:
+            old = merged.get(row["ticker"])
+            if old is not None and same_bar(old, row):
+                continue  # same bar -- keep the row already on disk, stamp and all
             merged[row["ticker"]] = row
+
+        content = "".join(json.dumps(merged[tkr]) + "\n" for tkr in sorted(merged))
+
+        # An identical rewrite would be harmless downstream -- same bytes, same
+        # MD5, still skipped by S3. It is skipped anyway so that a day file's
+        # modification time keeps meaning "when this day's data last changed".
+        if path.exists() and path.read_text() == content:
+            continue
 
         # Write to a temp file, then swap it in atomically. A crash mid-write
         # leaves the intact old file rather than a truncated one.
         tmp = path.with_suffix(".jsonl.tmp")
-        with tmp.open("w") as f:
-            for tkr in sorted(merged):
-                f.write(json.dumps(merged[tkr]) + "\n")
+        tmp.write_text(content)
         tmp.replace(path)
+        rewritten += 1
 
-    return len(by_date)
+    return len(by_date), rewritten
 
 
 def write_manifest(run_id, mode, start, end, requested, succeeded, failed, rows) -> dict:
@@ -304,12 +345,13 @@ def run(tickers: list, days_back: int, mode: str, verbose: bool = True) -> dict:
         if i < len(tickers):
             time.sleep(SLEEP_SECONDS)
 
-    files = write_day_files(all_rows)
+    files, rewritten = write_day_files(all_rows)
     manifest = write_manifest(run_id, mode, start, end, tickers, succeeded, failed, all_rows)
 
     print(f"\nFinished in {time.time() - t0:.0f}s")
     print(f"  {len(succeeded)}/{len(tickers)} tickers ok, {len(failed)} failed")
-    print(f"  {len(all_rows)} bars -> {files} day files under {DATA_DIR.name}/")
+    print(f"  {len(all_rows)} bars -> {files} day files under {DATA_DIR.name}/"
+          f" ({rewritten} rewritten, {files - rewritten} unchanged)")
     print(f"  newest trade date: {manifest['newest_trade_date']} "
           f"({manifest['lag_days_vs_run']} days behind today)")
     print(f"  manifest: data/_runs/run_{run_id}.json")

@@ -54,3 +54,10 @@ profiles.yml
 *.key
 id_rsa*
 rsa_key*
+
+# Airflow's local state, created on first `docker compose up`. The compose file
+# is the deployment definition and belongs in the repo; nothing else here does.
+# config/airflow.cfg alone is ~170KB of generated defaults, rewritten whenever
+# it is missing, and `git add .` would take it without asking.
+airflow/config/
+airflow/plugins/

@@ -32,11 +32,11 @@ This repository is my answer to those four, one file at a time.
 flowchart TD
     API["Massive / Polygon API<br/><i>daily bars · 5 calls/min · free tier</i>"]
     LOCAL["Local partitions<br/><code>data/date=YYYY-MM-DD/prices.jsonl</code>"]
-    S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>503 partitions</i>"]
+    S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>509 partitions</i>"]
     RAW["Snowflake <code>raw.raw_prices</code><br/><i>one VARIANT column, uncast</i>"]
-    STG["Snowflake <code>staging.stg_prices</code><br/><i>12,529 typed rows</i>"]
+    STG["Snowflake <code>staging.stg_prices</code><br/><i>12,725 typed rows</i>"]
     SEED["<code>dbt/seeds/ticker_reference.csv</code><br/><i>25 rows · company name + GICS sector</i>"]
-    MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 + 12,529 rows</i>"]
+    MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 + 12,725 rows</i>"]
     DASH["Streamlit dashboard<br/><i>not built yet — step 12</i>"]
 
     API -->|"<b>fetch_tickers.py</b><br/>trailing window · merge on (trade_date, ticker)"| LOCAL
@@ -58,39 +58,73 @@ and the pipeline was built to make that step boring: every stage is already safe
 | | |
 |---|---|
 | Tickers | 25 large-caps across 8 GICS sectors (`tickers.txt`; names and sectors in `dbt/seeds/ticker_reference.csv`) |
-| Trading days | 503 — 2024-08-26 through 2026-08-27 |
-| Rows | 12,529 in `raw.raw_prices`, 12,529 in `staging.stg_prices` |
-| Distinct `(ticker, trade_date)` | 12,529 |
-| Marts | `marts.dim_tickers` 25 rows · `marts.fct_daily_prices` 12,529 rows |
-| `COPY INTO` | 503/503 files loaded, 0 errors, 6.1s |
+| Trading days | 509 — 2024-08-26 through 2026-09-04 |
+| Rows | 12,725 in `raw.raw_prices`, 12,725 in `staging.stg_prices` |
+| Distinct `(ticker, trade_date)` | 12,725 |
+| Marts | `marts.dim_tickers` 25 rows · `marts.fct_daily_prices` 12,725 rows |
+| `COPY INTO` | 509/509 files loaded, 0 errors |
 | Re-run of the same `COPY INTO` | `Copy executed with 0 files processed.` |
 
-12,529 rather than 503 × 25 = 12,575. The gap is not missing data: two of those 503 dates come
-from smoke-test runs rather than a full pass — 2026-08-26 holds three tickers, 2026-08-27 holds
-one. The remaining 501 dates are complete for all 25. I had assumed the rows were absent
-upstream until a count per date said otherwise.
+509 × 25 = 12,725, and every date is complete for all 25 tickers.
+
+It was not always. For two weeks the table held 12,529 rows across 503 dates, and this README
+explained the shortfall by saying the rows were absent upstream at the provider. They were not.
+Two of those dates came from my own smoke-test runs rather than a full pass — 2026-08-26 held
+three tickers and 2026-08-27 held one — which is exactly the four rows that 12,525 and 12,529
+differ by, a fact that had been sitting in my own notes for ten days before I read it properly.
+A count per date said so in one query. Both dates filled in on the next full run.
 
 ---
 
-## Idempotency, measured at three layers
+## Idempotency, measured at three layers — and then at the seams
 
 Re-running any stage changes nothing. That is the property the whole design is organised
 around, and each layer earns it differently:
 
 | Layer | Mechanism | Measured result |
 |---|---|---|
-| Local files | Each run fetches a trailing **window** of days and merges on `(trade_date, ticker)`; writes go to a temp file and are swapped in with an atomic `replace()` | Four consecutive runs, 15 rows every time |
-| S3 | One `ListObjectsV2` returns every key with its ETag; for a single-part upload the ETag *is* the content MD5, so unchanged files are skipped without downloading anything | First run 503 uploaded / 0 skipped · immediate second run **503 skipped / 0 uploaded / 0 bytes sent** |
-| Snowflake | `COPY INTO` consults its own load history and ignores files it has already loaded | Second `COPY INTO`: 0 files processed |
+| Local files | Each run fetches a trailing **window** of days and merges on `(trade_date, ticker)`; writes go to a temp file and are swapped in with an atomic `replace()` | 25 tickers over a 14-day window, 250 bars returned: **10 day files touched, 0 rewritten** |
+| S3 | One `ListObjectsV2` returns every key with its ETag; for a single-part upload the ETag *is* the content MD5, so unchanged files are skipped without downloading anything | **0 uploaded, 509 skipped, 0 bytes sent** |
+| Snowflake | `COPY INTO` consults its own load history and ignores files it has already loaded | **`Copy executed with 0 files processed.`** |
+
+Those three results are one sequence, run in order, starting from a live fetch of every ticker.
+That they are consecutive is the point, and it is a more recent claim than it looks.
 
 The trailing window is why a missed day is not a lost day. If the job does not run for three
 days, the next run backfills them without being told to; a bar that published late gets picked
 up on the following run. I chose a window over "fetch yesterday" for that reason, and it is the
 decision the rest of the design leans on hardest.
 
-One deliberate exception: the *set* of rows is idempotent, but the `ingested_at_utc` stamp is
-rewritten on every run. The freshness tests in step 11 need to know when a row was last seen,
-not when it was first seen.
+### Each layer was correct and the pipeline still was not
+
+For two weeks I had a version of that table and believed the composition followed from it. It
+does not, and the reason turned out to be worth more than the property.
+
+Every layer had been tested by running that one stage twice with nothing in between — which is
+precisely the condition under which nothing upstream has changed the bytes. Run the whole chain
+instead and something else happens. `fetch_tickers.py` used to re-stamp `ingested_at_utc` on
+every row on every run, deliberately, so the stamp would mean "when this row was last seen". A
+trailing window re-fetches days whose prices settled weeks ago; those rows got a new stamp, so
+the file's bytes changed, so its MD5 no longer matched the S3 ETag, so it was re-uploaded — and
+Snowflake skips a staged file only when it has loaded that file before **and** the file has not
+changed since. So the file loaded again, in full.
+
+The run that found it: 10 day files touched, 10 re-uploaded, 10 re-copied, 250 rows added, of
+which **54 were duplicates**. Twenty-five of those came from a single date that had gained no
+new data at all. The arithmetic is what makes it a mechanism rather than a coincidence —
+25 + 25 + 3 + 1, one term per file that already had rows in it.
+
+Nothing raised an error anywhere. It surfaced because `scripts/snowflake_copy.py` compares
+`COUNT(*)` against `COUNT(DISTINCT (ticker, trade_date))` after every load and exits non-zero
+when they differ. That check was written before I knew this was a real risk, for no better
+reason than that `sql/06_snowflake_raw_load.sql` states the invariant in a comment.
+
+The fix is in the merge, not in the warehouse. A row whose bar came back unchanged keeps its
+original `ingested_at_utc`, and a day file whose content is unchanged is not rewritten at all —
+so unchanged bytes now propagate all the way down. `ingested_at_utc` means *first seen, or last
+seen to change*; when a row last reached the warehouse is a different question, and
+`raw_prices.loaded_at` answers it. Deduplicating in the staging model would also have made the
+symptom go away, in one line, which is the same objection as the one below.
 
 ---
 
@@ -156,7 +190,7 @@ test in step 11 — whose entire purpose is to catch exactly that — would be p
 green. The staging layer's job is to make raw data typed and legible, not to make it look clean.
 
 **A table, not a view.** dbt's convention for a staging layer is a view. I chose a table: the
-step's definition of done was one clean table, 12,529 rows is kilobytes, and the dashboard in
+step's definition of done was one clean table, 12,725 rows is kilobytes, and the dashboard in
 step 12 reads this object on every page load. If that calculus changes it is one word in
 `dbt_project.yml`.
 
@@ -175,9 +209,10 @@ a surrogate would buy a join hop and a package dependency. A Type 2 snapshot ove
 changes would demonstrate the pattern without testing it.
 
 **Every window partitions by ticker, and that is load-bearing.** Without `partition by ticker`
-these functions walk one stream of 12,529 rows ordered by date, where the row before any given
+these functions walk one stream of every row ordered by date, where the row before any given
 AAPL row is a different company on the same day. I measured that rather than assuming it: computing
-`prior_close` both ways, **12,526 of the 12,529 rows disagree**. The three that agree are the first
+`prior_close` both ways over the 12,529 rows the table held at the time, **12,526 of them
+disagree**. The three that agree are the first
 row of the table, where both versions are null, and two coincidences where two companies closed at
 the same price on adjacent rows. No error, no warning — a column of numbers that are almost all
 wrong and all look reasonable. The check for it is cheap and binary: `prior_close` must be null on
@@ -300,6 +335,29 @@ instead of forty frames of stack trace. And `dbt seed` before `dbt run`: `dbt ru
 seeds, and `dim_tickers` reads one, so running the models alone fails on a table that was never
 created.
 
+**6. Running it again**
+
+Once the setup above is done, the pipeline is four commands:
+
+```bash
+python fetch_tickers.py              # 7-day trailing window
+python upload_to_s3.py
+python scripts/snowflake_copy.py     # the COPY INTO from sql/06, as a script
+cd dbt && dbt seed && dbt run
+```
+
+`scripts/snowflake_copy.py` exists so that the Snowflake load is callable rather than pasted into
+a browser — a scheduler cannot use a worksheet. It reads its connection from the
+`~/.dbt/profiles.yml` that step 5 wrote, so it holds no credential of its own; it runs the
+verification query from `sql/06` section 6 and prints the counts; and it exits non-zero if the row
+count and the distinct `(ticker, trade_date)` count ever disagree. **Zero files processed is a
+success, not a failure** — that is the load history doing its job, and getting it backwards would
+make a healthy pipeline go red every morning after the first.
+
+Run those four twice in a row and nothing should move: 0 day files rewritten, 0 objects uploaded,
+0 files copied. That is the property the section above is about, and it is worth checking rather
+than assuming.
+
 ---
 
 ## Repository layout
@@ -315,7 +373,7 @@ aws/                    IAM policy and trust policy documents, with the bootstra
 dbt/                    dbt project: one source, a staging model, a seed, and the marts star.
 docs/                   Runbooks for the two stages that involve a console: Snowflake and dbt.
 notebooks/              How each step was worked out, with outputs kept as evidence.
-scripts/                Credential setup, the secret scanner, and the hook installer.
+scripts/                Credential setup, the Snowflake load, the secret scanner, the hook installer.
 ```
 
 `notebooks/` keeps its outputs on purpose. They are the record that each stage ran and what it
@@ -352,5 +410,11 @@ Roughly **$1–3/month** at this volume — an XS Snowflake warehouse billed by 
 60-second auto-suspend, plus a few megabytes of S3. The API tier is free.
 
 The warehouse is not the source of truth; **S3 is.** If Snowflake were switched off tomorrow,
-`sql/06_snowflake_raw_load.sql` rebuilds it from the same 503 files in about twenty minutes. That
+`sql/06_snowflake_raw_load.sql` rebuilds it from the same 509 files in about twenty minutes. That
 was a design goal, not a happy accident.
+
+I have since had cause to do it rather than claim it. Cleaning up the duplicate load described
+above meant `TRUNCATE TABLE raw_prices` — which drops Snowflake's load history along with the
+rows, so every file becomes loadable again — followed by one run of `scripts/snowflake_copy.py`.
+From an empty table to 509 files and 12,725 rows took under a minute. The twenty minutes is the
+setup around it, not the data.

@@ -285,7 +285,7 @@ from one schema and writing to another, with no macro involved.
 
 **`stg_prices` is a table, not a view.** The dbt convention for a staging layer
 is a view — no storage, never stale. A table is the choice here because the
-step's definition of done says one clean table, because 12,529 rows of storage
+step's definition of done says one clean table, because 12,725 rows of storage
 is measured in kilobytes, and because the Streamlit dashboard in step 12 reads
 this object on every page load. It is one word in `dbt_project.yml` if that
 changes.
