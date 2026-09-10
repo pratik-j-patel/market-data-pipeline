@@ -46,7 +46,7 @@ models:
       # The dbt convention for a staging layer is a view: it costs no storage
       # and it is never stale. I am choosing a table anyway, for three reasons.
       # The step's own definition of done is "builds one clean table". At
-      # 12,725 rows the storage is a rounding error -- kilobytes. And the
+      # this volume the storage is a rounding error -- kilobytes. And the
       # Streamlit dashboard in step 12 queries this object directly, where
       # reading stored rows beats re-running the casts on every page load.
       #

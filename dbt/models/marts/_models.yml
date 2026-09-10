@@ -6,7 +6,20 @@
 # Those are different jobs and they are deliberately different folders, built
 # into different schemas.
 #
-# Descriptions only, again. Tests are step 11.
+# The severity rule these tests follow is written out once, in
+# models/staging/_models.yml. Short version: a broken grain is an error because
+# this pipeline is wrong; a strange number is a warning because the provider is.
+#
+# ONE INVARIANT IS DELIBERATELY NOT TESTED TWICE.
+#   dim_tickers carries trading_days and price_rows as separate columns
+#   precisely so that a duplicate shows up as an inequality between them. It is
+#   tempting to add a test asserting they are equal for every ticker -- and it
+#   would be redundant, because price_rows exceeds trading_days if and only if
+#   stg_prices holds a duplicate (ticker, trade_date), which is exactly what the
+#   uniqueness test on stg_prices.price_key already fails on. Two tests for one
+#   fault means two alerts, two investigations and one fix. The columns stay,
+#   because they make the fault legible to a person reading the dimension; the
+#   second test does not.
 # =============================================================================
 
 version: 2
@@ -19,33 +32,85 @@ models:
       to any fact table on ticker. Type 1 -- an attribute change overwrites the
       row and no history is kept, which is honest for 25 large-caps whose
       sectors do not move.
+
     columns:
       - name: ticker
         description: >
           Exchange symbol. The grain and the natural key -- unique, stable, and
           used directly rather than behind a surrogate integer.
+        data_tests:
+          # The pair that makes the natural key defensible. Choosing a natural
+          # key over a surrogate integer is a bet that the real-world value is
+          # unique and always present; these two tests are what turn that bet
+          # into something checked on every run rather than assumed in a
+          # comment. Error on both -- if this fails, the dimension has stopped
+          # being a dimension and the relationships test below is meaningless.
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
       - name: company_name
         description: >
           Display name from the seed. NULL means this ticker has price history
           but is missing from seeds/ticker_reference.csv -- a real gap, left
           visible on purpose.
+        data_tests:
+          # WARN. The full outer join in dim_tickers.sql exists so that a
+          # ticker which trades but was never written down surfaces as a NULL
+          # here instead of vanishing. This test is what turns that NULL from
+          # something a person might notice into something dbt says out loud.
+          # It is a warning because the fix is a line in a CSV, not a rebuild:
+          # the prices are fine, only the label is missing.
+          - not_null:
+              config:
+                severity: warn
+
       - name: sector
         description: >
-          GICS sector from the seed. Eight distinct values. NULL carries the
-          same meaning as a NULL company_name.
+          GICS sector from the seed. Eight distinct values across the current
+          25 tickers. NULL carries the same meaning as a NULL company_name.
+        data_tests:
+          - not_null:
+              config:
+                severity: warn
+
       - name: first_trade_date
         description: Earliest session the warehouse holds for this ticker.
+        data_tests:
+          # The mirror image of the company_name test, and the reason the join
+          # is FULL OUTER rather than LEFT in either direction. NULL here means
+          # a ticker is written down in the seed and has never traded -- which
+          # in practice means either a typo in the symbol or a fetch that has
+          # been quietly failing for that one ticker while the other 24 succeed
+          # and the run exits zero.
+          #
+          # WARN, because 24 tickers of correct data should still reach the
+          # dashboard while this is chased down.
+          - not_null:
+              config:
+                severity: warn
+
       - name: last_trade_date
         description: Latest session the warehouse holds for this ticker.
+
       - name: trading_days
         description: >
-          Distinct sessions held. 509 is the full window; anything less is
-          genuinely absent upstream, not dropped by this pipeline.
+          Distinct sessions held. The number grows by one each trading day, so it
+          is not worth writing down here; what matters is that it is the same for
+          every ticker. Anything less for one ticker is genuinely absent upstream,
+          not dropped by this pipeline.
+
       - name: price_rows
         description: >
-          Rows in stg_prices for this ticker. Should equal trading_days.
-          If it does not, stg_prices holds a duplicate -- which is exactly what
-          the staging layer declines to hide.
+          Rows in stg_prices for this ticker. Should equal trading_days. If it
+          does not, stg_prices holds a duplicate -- which is what the staging
+          layer declines to hide, and what the uniqueness test on
+          stg_prices.price_key fails on. This column is here to make that fault
+          readable at a glance, not to be tested separately; see the note at
+          the top of this file.
 
   - name: fct_daily_prices
     description: >
@@ -54,15 +119,56 @@ models:
       to dim_tickers on ticker. Carries no company or sector columns of its own,
       deliberately -- one join is cheaper than a sector correction that has to be
       made in two places.
+
     columns:
       - name: price_key
         description: >
           ticker and trade_date joined. The grain as one column, carried through
-          from staging so step 11's uniqueness test has a single column to work on.
+          from staging so the uniqueness test here works on a single column.
+        data_tests:
+          # Tested here as well as in staging, and that is not duplication of
+          # the kind the note at the top of this file warns about. The staging
+          # test asserts the LOAD is clean. This one asserts the TRANSFORM did
+          # not introduce a duplicate of its own -- a join added later, a window
+          # rewritten into a self-join. They can fail independently, and which
+          # one fails tells you which half of the pipeline to look at.
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
       - name: ticker
         description: Exchange symbol. The join key into dim_tickers.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+          # Referential integrity, which nothing in a warehouse enforces for
+          # you. Snowflake accepts foreign key constraints and then does not
+          # check them; this test is the check. It fails if the fact table holds
+          # a ticker the dimension has never heard of, which is the state that
+          # makes a dashboard's sector filter silently drop rows -- the join
+          # finds no match, the row disappears from the chart, and no total
+          # anywhere says it is missing.
+          # `to` and `field` are ARGUMENTS to the test; `severity` is CONFIG.
+          # At the top level those look identical, which is why dbt 1.10 moved
+          # arguments under their own key and 1.12 warns on the old spelling.
+          - relationships:
+              arguments:
+                to: ref('dim_tickers')
+                field: ticker
+              config:
+                severity: error
+
       - name: trade_date
         description: The session this row covers.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
       - name: open
         description: First traded price of the session.
       - name: high
@@ -81,6 +187,9 @@ models:
         description: >
           The previous session's close for the same ticker. NULL on each ticker's
           first row -- correct, not missing: there is no earlier session to name.
+          Deliberately untested for nulls: exactly 25 nulls is the expected
+          state, and it is the binary evidence that `partition by ticker` is
+          present in the window.
       - name: daily_return_pct
         description: >
           Percent change from prior_close. NULL wherever prior_close is NULL, and
@@ -106,5 +215,5 @@ models:
       - name: loaded_at
         description: >
           When COPY INTO wrote the underlying raw row, UTC. Carried so a dashboard
-          can show "data as of" and so step 11 can test freshness here without
-          reaching back through staging.
+          can show "data as of", and so the freshness question can be asked here
+          without reaching back through staging.

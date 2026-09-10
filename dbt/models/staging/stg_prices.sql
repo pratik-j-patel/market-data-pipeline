@@ -101,7 +101,7 @@ keyed as (
 -- A `qualify row_number() over (partition by price_key ...) = 1` here would be
 -- one line and would guarantee this table always looks correct. That is the
 -- problem with it. The duplicate it silently absorbed would be a real load
--- fault upstream, and the step 11 uniqueness test -- the whole point of which
+-- fault upstream, and the uniqueness test on this column -- the whole point of which
 -- is to notice exactly that -- would be permanently, uselessly green.
 --
 -- The staging layer's job is to make the raw data typed and legible. It is not

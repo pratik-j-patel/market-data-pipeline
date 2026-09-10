@@ -128,14 +128,38 @@ with DAG(
 
     dbt_build = BashOperator(
         task_id="dbt_build",
-        # `dbt seed` every run: the seed is 25 static rows, so reloading it costs
-        # nothing, and it means editing ticker_reference.csv takes effect without
+        # `dbt build`, not `dbt seed && dbt run && dbt test`.
+        #
+        # build interleaves the three: it loads the seed, builds a model, runs
+        # that model's tests, and only then builds what depends on it. The
+        # ordering is the entire point. A duplicate (ticker, trade_date) in
+        # stg_prices does not merely appear twice in fct_daily_prices -- it
+        # shifts every 20-day moving average whose window spans it. `run` then
+        # `test` would compute those wrong averages first and report the fault
+        # afterwards, leaving a mart that is wrong and a test that says so.
+        # build refuses to construct the mart at all.
+        #
+        # Measured 2026-09-10 by planting a duplicate row in raw_prices: the
+        # uniqueness test failed and 13 downstream nodes were SKIPPED, both
+        # marts among them. Removing the row put all 29 back to green.
+        #
+        # The seed still loads on every run: 25 static rows cost nothing to
+        # reload, and it means editing ticker_reference.csv takes effect without
         # anyone remembering a second command.
-        bash_command=f"cd {REPO}/dbt && {DBT} seed && {DBT} run",
+        #
+        # `dbt source freshness` is deliberately NOT a fifth task here. It asks
+        # a looser version of a question tests/assert_prices_are_current.sql
+        # already answers inside this command, and answers more precisely --
+        # counting weekdays behind the newest bar rather than hours since the
+        # last load. Two tasks for one invariant means two alerts and one fix.
+        bash_command=f"cd {REPO}/dbt && {DBT} build",
         execution_timeout=pendulum.duration(minutes=15),
-        doc_md="Builds staging.stg_prices, then marts.dim_tickers and "
-               "marts.fct_daily_prices. Ignore dbt's out-of-date banner; 1.12.0 "
-               "is pinned deliberately and requirements.txt says why.",
+        doc_md="Seeds, builds and TESTS in dependency order: staging.stg_prices, "
+               "then marts.dim_tickers and marts.fct_daily_prices, with 25 data "
+               "tests interleaved. A failed test on staging skips the marts "
+               "rather than building them from rows already known to be bad. "
+               "Ignore dbt's out-of-date banner; 1.12.0 is pinned deliberately "
+               "and requirements.txt says why.",
     )
 
     fetch_prices >> upload_to_s3 >> snowflake_copy >> dbt_build

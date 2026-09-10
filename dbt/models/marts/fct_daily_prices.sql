@@ -13,9 +13,9 @@
 -- grain. Widening or rolling up would be a different table, not this one.
 --
 -- Joins to dim_tickers on ticker for company name and sector. Deliberately does
--- NOT carry those columns itself: duplicating a sector across 12,725 rows to
--- save one join means a sector correction has to be made in two places, and the
--- second one gets forgotten.
+-- NOT carry those columns itself: duplicating a sector across every row of every
+-- session to save one join means a sector correction has to be made in two places,
+-- and the second one gets forgotten.
 -- =============================================================================
 
 with
@@ -51,7 +51,7 @@ windowed as (
     -- day. No error, no warning, no null -- just a column of numbers that are
     -- almost all wrong and all look reasonable, which is exactly the kind of
     -- wrong that survives review. Measured rather than assumed: computing
-    -- prior_close both ways over the 12,529 rows the table held at the time,
+    -- prior_close both ways over the 12,529 rows the table held on 2026-09-06,
     -- 12,526 of them disagree.
     --
     -- ROWS, not RANGE. `rows between 19 preceding` counts twenty ROWS, which
@@ -164,9 +164,10 @@ measured as (
 -- clear-eyed about what that costs here: a duplicate (ticker, trade_date) would
 -- not merely appear twice, it would shift every window that spans it -- the
 -- moving average would be computed over nineteen real sessions and one repeat.
--- The answer is still not to hide it. It is that step 11's uniqueness test on
--- price_key is what catches it, and a mart that silently absorbed the duplicate
--- would leave that test green while carrying wrong averages.
+-- The answer is still not to hide it. It is that the uniqueness test on price_key
+-- is what catches it, and a mart that silently absorbed the duplicate would leave
+-- that test green while carrying wrong averages. Measured 2026-09-10: planting one
+-- duplicate row failed that test and SKIPPED this model rather than building it.
 select
     -- grain
     price_key,
@@ -191,8 +192,8 @@ select
     dollar_volume,
 
     -- lineage: when COPY INTO wrote the underlying row. Carried so the dashboard
-    -- can say "data as of", and so step 11 has a timestamp to test freshness on
-    -- without reaching back through staging.
+    -- can say "data as of", and so freshness can be asked here without reaching
+    -- back through staging.
     loaded_at
 
 from measured

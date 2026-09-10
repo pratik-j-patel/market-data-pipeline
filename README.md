@@ -33,20 +33,20 @@ flowchart TD
     AF["Airflow DAG <code>market_data_pipeline</code><br/><i>07:00 America/New_York · weekdays · catchup off</i>"]
     API["Massive / Polygon API<br/><i>daily bars · 5 calls/min · free tier</i>"]
     LOCAL["Local partitions<br/><code>data/date=YYYY-MM-DD/prices.jsonl</code>"]
-    S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>509 partitions</i>"]
+    S3["AWS S3<br/><code>raw/prices/date=.../prices.jsonl</code><br/><i>one object per trading day</i>"]
     RAW["Snowflake <code>raw.raw_prices</code><br/><i>one VARIANT column, uncast</i>"]
-    STG["Snowflake <code>staging.stg_prices</code><br/><i>12,725 typed rows</i>"]
+    STG["Snowflake <code>staging.stg_prices</code><br/><i>one typed row per ticker per day</i>"]
     SEED["<code>dbt/seeds/ticker_reference.csv</code><br/><i>25 rows · company name + GICS sector</i>"]
-    MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 + 12,725 rows</i>"]
+    MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 tickers × every session</i>"]
     DASH["Streamlit dashboard<br/><i>not built yet — step 12</i>"]
 
     AF -.->|"four tasks, in order"| API
     API -->|"<b>fetch_tickers.py</b><br/>trailing window · merge on (trade_date, ticker)"| LOCAL
     LOCAL -->|"<b>upload_to_s3.py</b><br/>skip when local MD5 == S3 ETag"| S3
     S3 -->|"<b>COPY INTO</b><br/>keyless storage integration"| RAW
-    RAW -->|"<b>dbt run</b><br/>hand-written type casts"| STG
-    STG -->|"<b>dbt run</b><br/>window functions, partitioned by ticker"| MARTS
-    SEED -->|"<b>dbt seed</b><br/>the one thing the API cannot send"| MARTS
+    RAW -->|"<b>dbt build</b><br/>hand-written type casts, then 25 tests"| STG
+    STG -->|"<b>dbt build</b><br/>window functions, partitioned by ticker"| MARTS
+    SEED -->|"<b>dbt build</b><br/>loads the one thing the API cannot send"| MARTS
     MARTS -.-> DASH
 ```
 
@@ -60,17 +60,25 @@ section after next explains why.
 
 ## What is actually in the warehouse
 
+The figures below are deliberately written as invariants rather than as a row count on some
+particular morning. A number that changes every trading day is a maintenance liability in prose:
+it is wrong by the following week, and re-typing it is not a check on anything. What is worth
+stating is the shape the data is supposed to hold — and since the tests landed, every line in
+this table is verified on every run rather than asserted here.
+
 | | |
 |---|---|
 | Tickers | 25 large-caps across 8 GICS sectors (`tickers.txt`; names and sectors in `dbt/seeds/ticker_reference.csv`) |
-| Trading days | 509 — 2024-08-26 through 2026-09-04 |
-| Rows | 12,725 in `raw.raw_prices`, 12,725 in `staging.stg_prices` |
-| Distinct `(ticker, trade_date)` | 12,725 |
-| Marts | `marts.dim_tickers` 25 rows · `marts.fct_daily_prices` 12,725 rows |
-| `COPY INTO` | 509/509 files loaded, 0 errors |
+| Trading days | Every session from **2024-08-26** to the most recent close the provider has published |
+| Rows | One per ticker per trading day — the same count in `raw.raw_prices`, `staging.stg_prices` and `marts.fct_daily_prices` |
+| Distinct `(ticker, trade_date)` | Equal to the row count. A dbt `unique` test on `price_key` fails the build if it ever is not |
+| Marts | `marts.dim_tickers`, one row per ticker · `marts.fct_daily_prices`, the fact grain above |
+| `COPY INTO` | Every staged file loaded, 0 errors |
 | Re-run of the same `COPY INTO` | `Copy executed with 0 files processed.` |
 
-509 × 25 = 12,725, and every date is complete for all 25 tickers.
+Tickers times sessions, with no gaps and no repeats. `dim_tickers` carries `trading_days` and
+`price_rows` side by side for each ticker precisely so that a violation is legible at a glance:
+equal for all 25 means no duplicates, and unequal for one names the ticker to go and look at.
 
 It was not always. For two weeks the table held 12,529 rows across 503 dates, and this README
 explained the shortfall by saying the rows were absent upstream at the provider. They were not.
@@ -89,7 +97,7 @@ around, and each layer earns it differently:
 | Layer | Mechanism | Measured result |
 |---|---|---|
 | Local files | Each run fetches a trailing **window** of days and merges on `(trade_date, ticker)`; writes go to a temp file and are swapped in with an atomic `replace()` | 25 tickers over a 14-day window, 250 bars returned: **10 day files touched, 0 rewritten** |
-| S3 | One `ListObjectsV2` returns every key with its ETag; for a single-part upload the ETag *is* the content MD5, so unchanged files are skipped without downloading anything | **0 uploaded, 509 skipped, 0 bytes sent** |
+| S3 | One `ListObjectsV2` returns every key with its ETag; for a single-part upload the ETag *is* the content MD5, so unchanged files are skipped without downloading anything | **0 uploaded, 509 skipped, 0 bytes sent** (2026-09-07) |
 | Snowflake | `COPY INTO` consults its own load history and ignores files it has already loaded | **`Copy executed with 0 files processed.`** |
 
 Those three results are one sequence, run in order, starting from a live fetch of every ticker.
@@ -142,6 +150,11 @@ to Friday**. Four tasks in a line, each one running a command from the section f
 `python fetch_tickers.py` on a laptop and the `fetch_prices` task execute byte-identical files,
 and this README cannot quietly stop describing what the scheduler actually does.
 
+**The last task is `dbt build`, so the pipeline tests itself on every run.** Not `dbt run`
+followed by `dbt test` — the difference matters and is explained in the section after next. A
+failed test on the staging model stops the marts from being built at all, rather than building
+them and then reporting that they are wrong.
+
 **07:00, and it expects yesterday.** A trading day's close is never available on that day: it
 appears somewhere between about 9pm ET that evening and about 11am ET the next morning. A 7am
 run therefore usually has yesterday's close and occasionally does not — which is fine, because
@@ -188,6 +201,124 @@ nothing left to do.
 A red run asks to be looked at. A green run that did nothing does not, and the only tell was a
 duration too short to be real. `start_date` now sits in the past, `catchup=False` keeps that from
 backfilling, and the reason is written where the line is.
+
+---
+
+## What the pipeline checks about itself
+
+Everything above describes a pipeline that moves data correctly. None of it would have noticed if
+that stopped being true. dbt will happily build a table containing the same row twice, or a
+session whose high is below its own close, or data that stopped arriving three weeks ago, and
+print a screen of green over all of it.
+
+There are now **25 tests**, and they run as part of the scheduled job rather than as something a
+person remembers to type. The whole suite — one seed, three models, 25 tests, 29 nodes — takes
+about **five seconds**.
+
+Twenty-one are dbt's built-in generic tests declared in YAML: uniqueness and not-null on the
+grain in both `stg_prices` and `fct_daily_prices`, a `relationships` test proving every ticker in
+the fact table exists in the dimension, `accepted_values` on sector. Four are singular tests —
+a `.sql` file whose rule is "this query must return no rows" — covering internal consistency of
+each bar, agreement between staging and the fact table, and the two described below.
+
+### Error or warning is a question about blame, not severity
+
+Every test declares one or the other, on a single rule:
+
+**A broken grain is an error.** A duplicate or missing `(ticker, trade_date)`, a null lineage
+column, a ticker the dimension has never heard of. Each means *this pipeline* is wrong, and each
+is something the code can be changed to prevent. Continuing past one means building marts out of
+rows already known to be bad.
+
+**A strange number is a warning.** A missing close, an impossible bar, a ticker with no sector.
+Each means *the provider* sent something strange. Failing the build discards thousands of good
+rows over a handful of bad ones and puts a red pipeline in front of someone at 7am who cannot fix
+the upstream data anyway.
+
+The line between them is not how bad the fault is. It is whose fault it is, and whether stopping
+would help. The one deliberate exception is `dbt/seeds/ticker_reference.csv`, where everything is
+an error: nothing in that file came from a provider, and every fault it can hold is a typo a
+person can fix in a minute. `Healthcare` where `Health Care` was meant looks wrong nowhere at all
+until it shows up as a ninth bar on a chart that should have eight.
+
+### The obvious freshness rule would have been wrong, and it was measured wrong rather than argued wrong
+
+The normal way to write a freshness check is "fail if the newest data is more than a day old."
+On this pipeline that rule fails on a Tuesday in September with nothing broken: Friday's session
+closed on the 4th, Saturday and Sunday have no bars, and Monday was Labor Day. The newest bar was
+four calendar days old and every stage had run perfectly. A check that cries wolf after every long
+weekend gets muted, and a muted check is worse than no check, because the project can still claim
+to have one.
+
+So the threshold is counted in **weekdays**, not days. `tests/assert_prices_are_current.sql`
+returns one row per weekday that has passed since the newest bar in the warehouse, which makes
+the row count itself the measure — the thresholds then live in dbt's `warn_if` and `error_if`
+rather than buried in a `WHERE` clause:
+
+- **one weekday behind is healthy.** A session's close is not published until that evening.
+- **two is routine** — a public holiday, or a bar that published after the morning run had already
+  been and gone. Both resolve themselves overnight.
+- **three or four warns.** Legitimate, but only in combination: a holiday adjacent to a weekend,
+  or a rare two-day closure.
+- **five or more errors.** That is a full trading week with no new data, and no holiday schedule
+  or publishing delay produces it.
+
+Two details in that file are there because a session setting could otherwise decide the answer.
+`DAYOFWEEKISO` is used rather than `DAYOFWEEK`, whose numbering follows the `WEEK_START` account
+parameter. And "today" is `convert_timezone('America/New_York', current_timestamp())::date`,
+because Snowflake's `current_timestamp` follows the session timezone, and what trading day it is
+happens to be a New York question — the same distinction the ingestion code already draws between
+sessions in Eastern time and instants in UTC.
+
+A source freshness check on `loaded_at` is kept as well, with far looser thresholds. It measures
+something different — when data last *arrived*, not what session it describes — and it is the
+weaker of the two here, because since the idempotency fix an unchanged file is not re-copied at
+all, so on a day the market was shut nothing loads and that clock does not move.
+
+### One test exists only because the others cannot fail on an empty table
+
+Every test above is written as "find the rows that break a rule, and fail if there are any." That
+phrasing has one hole in it and it is a wide one: **an empty table breaks no rules.** Drop every
+row from `stg_prices` and the uniqueness test passes, the not-null tests pass, the relationships
+test passes, and the whole suite reports green over a warehouse holding nothing.
+
+`tests/assert_warehouse_not_empty.sql` asserts the one thing none of the others can. It is what
+makes the rest of them mean something.
+
+### `dbt build`, not `dbt run` followed by `dbt test`
+
+`build` interleaves the two: it loads the seed, builds a model, runs that model's tests, and only
+then builds what depends on it. The ordering is the entire point here. A duplicated session does
+not merely appear twice in `fct_daily_prices` — it shifts every 20-day moving average whose window
+spans it. `run` then `test` computes those wrong averages first and reports the fault afterwards,
+leaving a mart that is wrong and a test that says so. `build` declines to construct the mart.
+
+### Proving they fail
+
+A test that has only ever been green has not been shown to work. Each of these was watched in at
+least two states before being trusted.
+
+The uniqueness test was checked by copying one existing row back into `raw.raw_prices` under a
+marked `source_file`, so the fault was a real duplicate key and the cleanup was one `DELETE`:
+
+```
+PASS=14  WARN=1  ERROR=1  SKIP=13
+```
+
+One error, and **thirteen skipped nodes** — both marts among them, along with every test that
+would have run against them. `fct_daily_prices` was never built on top of the bad rows. Deleting
+the planted row returned all 29 to green.
+
+The freshness test needed no staging at all. It came back with **four** on its first genuine run,
+because the warehouse really was four weekdays behind — a laptop that had not been opened since
+Tuesday — and went quiet on its own once the next scheduled run fetched the missing sessions. No
+code changed between those two states.
+
+One thing worth knowing before reading a failure in anger: dbt's `unique` test reports **one row
+per duplicated key, not per duplicated row.** Three copies of one `(ticker, trade_date)` is still
+`Got 1 result`. The 54 duplicate rows described earlier would have surfaced here as 54 results,
+one per affected date — which is exactly why they could be decomposed into 25 + 25 + 3 + 1 and
+read as a mechanism rather than a mystery.
 
 ---
 
@@ -249,16 +380,18 @@ absorbed it; the hand-written `::float` casts in the staging model resolved it. 
 **No deduplication in staging.** A `qualify row_number() over (partition by price_key ...) = 1`
 would be one line and would guarantee this table always looks correct. That is the objection to
 it. The duplicate it silently absorbed would be a real load fault upstream, and the uniqueness
-test in step 11 — whose entire purpose is to catch exactly that — would be permanently, uselessly
-green. The staging layer's job is to make raw data typed and legible, not to make it look clean.
+test — whose entire purpose is to catch exactly that — would be permanently, uselessly green.
+The staging layer's job is to make raw data typed and legible, not to make it look clean. That
+test now exists, and the decision to leave this table undeduplicated is what gives it anything
+to find.
 
 **A table, not a view.** dbt's convention for a staging layer is a view. I chose a table: the
-step's definition of done was one clean table, 12,725 rows is kilobytes, and the dashboard in
+step's definition of done was one clean table, the storage is kilobytes, and the dashboard in
 step 12 reads this object on every page load. If that calculus changes it is one word in
 `dbt_project.yml`.
 
 **`raw_prices` is declared as a dbt source, not a hard-coded three-part name.** Lineage then
-starts at S3 rather than at the staging model, and the freshness tests in step 11 have a node to
+starts at S3 rather than at the staging model, and the source freshness check has a node to
 attach to.
 
 **The marts layer is a star, and its key is the ticker symbol.** `dim_tickers` says what a symbol
@@ -390,13 +523,13 @@ Follow **[docs/dbt_setup.md](docs/dbt_setup.md)**.
 
 ```bash
 bash scripts/set_dbt_profile.sh      # generates the RSA key pair, writes ~/.dbt/profiles.yml
-cd dbt && dbt debug && dbt seed && dbt run
+cd dbt && dbt debug && dbt build
 ```
 
 `dbt debug` before anything, always — a profile mismatch fails with a sentence about connections
-instead of forty frames of stack trace. And `dbt seed` before `dbt run`: `dbt run` does not load
-seeds, and `dim_tickers` reads one, so running the models alone fails on a table that was never
-created.
+instead of forty frames of stack trace. `dbt build` rather than `dbt run`, for two reasons: `run`
+does not load seeds, and `dim_tickers` reads one, so running the models alone fails on a table
+that was never created — and `build` runs the tests in dependency order as it goes.
 
 **6. Running it again**
 
@@ -406,7 +539,7 @@ Once the setup above is done, the pipeline is four commands:
 python fetch_tickers.py              # 7-day trailing window
 python upload_to_s3.py
 python scripts/snowflake_copy.py     # the COPY INTO from sql/06, as a script
-cd dbt && dbt seed && dbt run
+cd dbt && dbt build                  # seed, models and 25 tests, in dependency order
 ```
 
 `scripts/snowflake_copy.py` exists so that the Snowflake load is callable rather than pasted into
@@ -465,7 +598,8 @@ tickers.txt             The 25-symbol universe. Comments allowed.
 airflow/                The orchestrator: compose file, the extended image, and the DAG.
 sql/                    The Snowflake side: warehouse, storage integration, stage, COPY INTO.
 aws/                    IAM policy and trust policy documents, with the bootstrap version kept.
-dbt/                    dbt project: one source, a staging model, a seed, and the marts star.
+dbt/                    dbt project: one source, a staging model, a seed, the marts star,
+                        and 25 tests. Singular tests live in dbt/tests/.
 docs/                   Runbooks for the two stages that involve a console: Snowflake and dbt.
 notebooks/              How each step was worked out, with outputs kept as evidence.
 scripts/                Credential setup, the Snowflake load, the secret scanner, the hook installer.
@@ -484,21 +618,35 @@ back. A 200 means the message arrived, not that the server did what was asked.
 
 In the order I intend to build them:
 
-1. **dbt tests and source freshness.** `stg_prices` already carries `price_key`, `source_file`,
-   `file_row_number` and `loaded_at` for exactly this: uniqueness and not-null on the first,
-   freshness on the last. The measure of success is breaking a source on purpose and having the
-   run fail loudly. One thing I already know: a freshness rule written as "fail if the newest
-   row is more than a day old" would page me every Tuesday after a long weekend. The largest
-   normal lag this pipeline shows is three days — Friday's close, a weekend, and a public
-   holiday — and that is a calendar fact, not a fault.
-2. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
+1. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
    `ticker` — which is the whole reason those two tables exist.
+2. **Orchestration somewhere that is not my laptop.** See below; a scheduled GitHub Actions
+   workflow would do it for free on a public repo, and the tasks already shell out to scripts
+   rather than importing them, which is most of the work.
 
-Things I know are missing and have not pretended otherwise. There are no automated tests yet,
-which is the first item above. And the scheduler runs on my laptop rather than anywhere durable:
-if the machine is asleep at 7am the run simply does not happen. The trailing window is what makes
-that survivable instead of a hole in the data, but it is a laptop, and I would not describe it
-as production.
+Things that are missing, named rather than left to be discovered.
+
+**Nothing alerts anybody.** The tests run on every scheduled build, and a failure turns the
+Airflow task red — but a *warning* does not. A warning is a line in a log that someone has to go
+and read, which on most days nobody does. The severity split described above is only half a
+design; the other half is somewhere for a warning to go, and that does not exist yet.
+
+**There is no CI.** The tests check the data. Nothing checks the code that moves it: a commit
+that breaks `fetch_tickers.py` is discovered by the next scheduled run, or by me.
+
+**The scheduler is a laptop, and the honest description of it is a reminder rather than a
+scheduler.** It is worth being precise about what that does and does not cost, because the
+behaviour turned out to be better than I assumed. Airflow's `catchup=False` means the scheduler
+asks one question when it starts — is there a past interval with no run? — and creates exactly
+one, rather than a backlog. So the 07:00 schedule does not control when the pipeline runs; it
+controls when the run becomes *due*, and opening the laptop is what actually triggers it. A run
+whose logical date is 07:00 and whose start time is 09:55 is the normal case, not a failure. An
+early schedule is deliberately the right choice for this reason: it guarantees the interval is
+already due whenever the machine comes up.
+
+What that buys is one run per weekday, on the first start of the day, with the trailing window
+covering anything skipped. What it does not buy is a pipeline that runs when nobody is watching,
+and I would not describe it as production.
 
 ---
 
@@ -508,11 +656,11 @@ Roughly **$1–3/month** at this volume — an XS Snowflake warehouse billed by 
 60-second auto-suspend, plus a few megabytes of S3. The API tier is free.
 
 The warehouse is not the source of truth; **S3 is.** If Snowflake were switched off tomorrow,
-`sql/06_snowflake_raw_load.sql` rebuilds it from the same 509 files in about twenty minutes. That
+`sql/06_snowflake_raw_load.sql` rebuilds it from the same objects in about twenty minutes. That
 was a design goal, not a happy accident.
 
 I have since had cause to do it rather than claim it. Cleaning up the duplicate load described
 above meant `TRUNCATE TABLE raw_prices` — which drops Snowflake's load history along with the
 rows, so every file becomes loadable again — followed by one run of `scripts/snowflake_copy.py`.
-From an empty table to 509 files and 12,725 rows took under a minute. The twenty minutes is the
-setup around it, not the data.
+On 2026-09-07 that took an empty table to 509 files and 12,725 rows in under a minute. The
+twenty minutes is the setup around it, not the data.

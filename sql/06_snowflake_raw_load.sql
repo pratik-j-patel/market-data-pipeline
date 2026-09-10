@@ -104,7 +104,7 @@ LIST @prices_stage;
 -- The three columns after the payload are file-level lineage: which S3 object a
 -- row came from, which line of it, and when it arrived. They are what makes a
 -- bad row traceable back to a specific line of a specific file, and they are the
--- raw material for the freshness tests in step 11.
+-- raw material for the source freshness check.
 
 CREATE TABLE IF NOT EXISTS raw_prices (
     payload          VARIANT       NOT NULL,
@@ -188,4 +188,4 @@ LIMIT 5;
 --
 -- The limit is worth knowing and worth writing down: that load history expires
 -- after 64 days. A file re-copied after that window duplicates its rows, which
--- is precisely what the uniqueness test in step 11 is there to catch.
+-- is precisely what the dbt uniqueness test on price_key is there to catch.

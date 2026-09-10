@@ -38,13 +38,66 @@ seeds:
       One row per ticker in the universe: the symbol, the company's name, and
       its GICS sector. Maintained by hand. Adding a ticker here and to
       tickers.txt is the whole process for widening the universe.
+    # -------------------------------------------------------------------------
+    # These tests are ERRORS, all of them, and that is a departure from the
+    # severity rule the rest of the project follows.
+    #
+    # Everywhere else a strange VALUE only warns, because the provider sent it
+    # and stopping the build cannot fix it. Nothing in this file came from a
+    # provider. Every row here was typed by hand, and every fault these tests
+    # can find is a typo that a person can correct in under a minute. A wrong
+    # sector spelled "Healthcare" instead of "Health Care" does not look wrong
+    # in a diff, it does not look wrong in the CSV, and it does not look wrong
+    # in the warehouse -- it looks wrong only as a ninth bar on a chart that
+    # should have eight. This is the layer where being strict is cheap.
+    # -------------------------------------------------------------------------
     columns:
       - name: ticker
         description: Exchange symbol. The natural key, and the join key into stg_prices.
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
       - name: company_name
         description: >
           Company name as it should be displayed. Four of these contain a
           comma, so the CSV quotes them -- a reminder that a comma-separated
           file is not the same thing as a file split on commas.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
       - name: sector
-        description: GICS sector. Eight distinct values across the 25 tickers.
+        description: >
+          GICS sector. Eight of the eleven appear across the current 25 tickers.
+        data_tests:
+          # ALL ELEVEN GICS SECTORS ARE LISTED, not the eight in use.
+          #
+          # Listing the eight present would make this test say "is this one of
+          # the sectors I happen to hold today", and adding the first utility or
+          # REIT to the universe would fail a test that is working correctly --
+          # which trains a person to edit the test rather than read it. Listing
+          # all eleven makes it say "is this a real GICS sector", which is the
+          # question actually worth asking, and it still catches every
+          # misspelling and every invented category.
+          - accepted_values:
+              arguments:
+                values:
+                  - 'Communication Services'
+                  - 'Consumer Discretionary'
+                  - 'Consumer Staples'
+                  - 'Energy'
+                  - 'Financials'
+                  - 'Health Care'
+                  - 'Industrials'
+                  - 'Information Technology'
+                  - 'Materials'
+                  - 'Real Estate'
+                  - 'Utilities'
+              config:
+                severity: error

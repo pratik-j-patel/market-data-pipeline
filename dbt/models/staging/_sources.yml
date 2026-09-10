@@ -10,8 +10,8 @@
 #      here, and dbt renders the rest. Point this file at a different schema and
 #      every model follows.
 #   2. It gives dbt a node for the raw table, so the lineage graph starts at S3
-#      instead of starting mid-pipeline, and so the freshness checks in step 11
-#      have something to attach to.
+#      instead of starting mid-pipeline, and so the freshness check below has
+#      something to attach to.
 # =============================================================================
 
 version: 2
@@ -30,12 +30,67 @@ sources:
         description: >
           Daily equity bars as delivered by the Polygon/Massive API, one
           untouched JSON object per row, plus three file-level lineage columns.
+
+        # ---------------------------------------------------------------------
+        # FRESHNESS -- the outer safety net.
+        #
+        # `dbt source freshness` takes max(loaded_at), compares it to now, and
+        # reports how old the newest arrival is. It answers "is anything still
+        # reaching the warehouse?" and nothing more.
+        #
+        # THIS IS THE LOOSE CHECK OF TWO, DELIBERATELY.
+        #   loaded_at only moves when COPY INTO actually writes something, and
+        #   since 2026-09-07 an unchanged file is not re-copied at all -- which
+        #   is the correct behaviour and the whole point of that day's fix. So
+        #   on a day the market was shut, nothing loads and this clock does not
+        #   advance, even though the pipeline ran perfectly.
+        #
+        #   Worst legitimate gap: a public holiday on a Thursday and a Friday.
+        #   Wednesday's bar loads Thursday morning, the market is then closed
+        #   through Friday, Monday finds nothing new to load, and the next load
+        #   is Tuesday morning -- five days later, with nothing wrong. Six days
+        #   is therefore the first number that is not explainable by the
+        #   calendar, and ten days contains at least six trading sessions, which
+        #   no market closure in living memory has covered.
+        #
+        # The precise check is tests/assert_prices_are_current.sql, which counts
+        # in weekdays instead of days and notices a stall two to three days
+        # sooner. Both are kept: this one is the standard mechanism, produces
+        # target/sources.json, and runs without building a single model.
+        #
+        # loaded_at is TIMESTAMP_NTZ holding UTC, because step 6 chose SYSDATE()
+        # over CURRENT_TIMESTAMP() for exactly this reason. dbt reads a naive
+        # timestamp as UTC and compares it against convert_timezone('UTC', ...),
+        # so the two agree. Had that column followed the session timezone this
+        # check would be wrong by the offset and would look right.
+        # ---------------------------------------------------------------------
+        #
+        # Both keys live under `config:` rather than at the top level. dbt 1.10
+        # moved them and 1.12 warns on the old spelling -- and a project that
+        # pins its dbt version specifically to avoid surprises should not then
+        # print a deprecation notice on every command.
+        config:
+          loaded_at_field: loaded_at
+          freshness:
+            warn_after:  {count: 6,  period: day}
+            error_after: {count: 10, period: day}
+
         columns:
           - name: payload
             description: >
               The API's JSON object, VARIANT, uncast. Ten fields: ticker,
               trade_date, open, high, low, close, volume, vwap, transactions,
               ingested_at_utc.
+            data_tests:
+              # A null payload means COPY INTO landed a line with no JSON in it
+              # -- a blank line, or a file that is not what it claims to be.
+              # Every cast in stg_prices reads through this column, so a null
+              # here becomes ten nulls one layer down and the cause is no longer
+              # visible from there. Caught at the source instead.
+              - not_null:
+                  config:
+                    severity: error
+
           - name: source_file
             description: Which S3 object this row came from (METADATA$FILENAME).
           - name: file_row_number
@@ -43,8 +98,5 @@ sources:
           - name: loaded_at
             description: >
               When COPY INTO wrote the row, UTC, from SYSDATE(). Deliberately
-              not CURRENT_TIMESTAMP(), which would follow the session timezone.
-
-        # Freshness thresholds and tests are step 11, not step 7. The columns
-        # they need -- loaded_at, source_file, file_row_number -- are carried
-        # through to staging so they are there when that step arrives.
+              not CURRENT_TIMESTAMP(), which would follow the session timezone
+              -- and which would quietly break the freshness check above.

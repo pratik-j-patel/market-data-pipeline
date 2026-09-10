@@ -1,9 +1,22 @@
 # =============================================================================
-# What the staging model produces.
+# What the staging model produces, and what has to be true of it.
 #
-# Descriptions only. The tests -- uniqueness, not-null, freshness -- are step
-# 11 and are deliberately not here yet; adding them now would spend a later
-# step's hours and give this one more ways to fail.
+# THE SEVERITY RULE, applied throughout this project and worth stating once:
+#
+#   ERROR -- the GRAIN is broken. A duplicate or missing (ticker, trade_date),
+#            a missing lineage column, a row that cannot be identified. Every
+#            one of these means THIS PIPELINE is wrong, and every one of them
+#            is something the code can be changed to prevent. A build that
+#            continues past one is building marts out of rows it knows are bad.
+#
+#   WARN  -- a NUMBER is strange. A missing close, an impossible bar, a ticker
+#            with no sector. These mean the PROVIDER sent something strange.
+#            Stopping the build discards thousands of good rows over a handful
+#            of bad ones and puts a red DAG at 7am in front of someone who
+#            cannot fix the upstream data anyway.
+#
+# The line between them is not "how bad is it" -- it is "whose fault is it, and
+# can stopping do anything about it".
 # =============================================================================
 
 version: 2
@@ -13,33 +26,105 @@ models:
     description: >
       Daily equity bars, typed. One row per ticker per trading day, every price
       and volume column cast explicitly rather than inferred. Carries the raw
-      table's lineage columns through unchanged.
+      table's lineage columns through unchanged. Deliberately not deduplicated,
+      which is what gives the uniqueness test below something real to catch.
+
     columns:
       - name: price_key
         description: ticker and trade_date joined -- the grain as a single column.
+        data_tests:
+          # THE TEST THIS WHOLE LAYER WAS SHAPED AROUND.
+          #
+          # price_key exists as a materialised column in stg_prices.sql for one
+          # reason: dbt's built-in `unique` works on a single column, so writing
+          # the compound key down in the model turns this test into four lines
+          # of YAML instead of a package dependency. That was decided in step 7,
+          # eight weeks before the test was written.
+          #
+          # It is also the test that already earned its place. On 2026-09-07 a
+          # hand-rolled version of exactly this comparison -- count(*) against
+          # count(distinct ticker||'|'||trade_date), inside
+          # scripts/snowflake_copy.py -- caught 54 duplicate rows produced by a
+          # re-stamped timestamp making Snowflake re-copy files it had already
+          # loaded. This is that check, promoted from a script to the layer that
+          # owns the invariant.
+          #
+          # And it can only work because stg_prices does not deduplicate. A
+          # `qualify row_number() = 1` upstream would leave this test
+          # permanently, uselessly green over a real load fault.
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
       - name: ticker
         description: Exchange symbol, e.g. AAPL.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
       - name: trade_date
         description: The session this bar covers. Never today's date -- a day's close is not published until overnight.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
       - name: open
         description: First traded price of the session. FLOAT by hand.
       - name: high
         description: Highest traded price of the session. FLOAT by hand.
       - name: low
         description: Lowest traded price of the session. FLOAT by hand.
+
       - name: close
         description: Last traded price of the session. FLOAT by hand -- this is the column AAPL's 229 lives in.
+        data_tests:
+          # WARN, not error. A null close is the provider omitting a number,
+          # not this pipeline losing one. It does make the row useless -- every
+          # derived measure in fct_daily_prices reads close, and a null one
+          # nulls the return, the moving average and the dollar volume for that
+          # row and the nineteen after it. That is a reason to be told, not a
+          # reason to refuse to rebuild the mart.
+          - not_null:
+              config:
+                severity: warn
+
       - name: volume
         description: Shares traded. FLOAT, not INTEGER -- 26% of values arrive fractional.
+
       - name: vwap
-        description: Volume-weighted average price for the session.
+        description: >
+          Volume-weighted average price for the session. NOT tested for nulls:
+          the API genuinely omits it on thin sessions, which is why
+          fct_daily_prices.dollar_volume falls back to close. A not-null test
+          here would fire on correct behaviour.
+
       - name: transaction_count
         description: Number of individual trades in the session.
+
       - name: ingested_at_utc
-        description: When the API produced the row, UTC, zone dropped.
+        description: >
+          When the API first produced this row, or last produced a changed
+          version of it, UTC, zone dropped. Since 2026-09-07 it is NOT
+          re-stamped on a bar that has not changed -- re-stamping it altered
+          the file's bytes, which made S3 re-upload and Snowflake re-copy, and
+          that is what manufactured the 54 duplicates.
+
       - name: source_file
         description: The S3 object this row was loaded from.
       - name: file_row_number
         description: The line within that object.
+
       - name: loaded_at
         description: When COPY INTO wrote the row into raw, UTC.
+        data_tests:
+          # Lineage, not measurement. A row that cannot say when it arrived
+          # cannot be reasoned about after the fact, and this column is what
+          # the source freshness check reads.
+          - not_null:
+              config:
+                severity: error

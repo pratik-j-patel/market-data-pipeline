@@ -101,7 +101,7 @@ substituting the two values from `DESC INTEGRATION`.
 Run section 3. `LIST @prices_stage` is the first statement that actually uses the
 role, so this is where a credential problem surfaces, before any table exists.
 
-- **509 rows listed** — the stage works.
+- **One row listed per trading day already uploaded** — the stage works.
 - **Zero rows, no error** — the stage authenticated but found nothing at that
   prefix. Check `URL` and `STORAGE_ALLOWED_LOCATIONS` against the real prefix.
 - **An access-denied or assume-role error** — check the trust policy: both the
@@ -112,9 +112,13 @@ Then run sections 4 and 5. Section 6 should return the same figures the local
 copy holds:
 
 ```
-$ ls -d data/date=*/ | wc -l          # 509 partitions
-$ cat data/date=*/prices.jsonl | wc -l # 12725 rows
+$ ls -d data/date=*/ | wc -l           # partitions on disk
+$ cat data/date=*/prices.jsonl | wc -l # rows on disk
 ```
+
+Both should match what section 6 reports in Snowflake. The exact figures grow by
+one partition and 25 rows per trading day, which is why they are not written down
+here — the point is that the two sides agree, not what the number is today.
 
 `rows_loaded` and `distinct_keys` should be equal. If `distinct_keys` is lower,
 the same file was loaded twice.
