@@ -227,6 +227,64 @@ def measure(cur, database: str) -> dict:
     }
 
 
+def classify_duplicates(cur, database: str) -> dict:
+    """Split duplicate (ticker, trade_date) keys into the two cases that mean
+    different things.
+
+    A key whose loads all carry the SAME seven numbers was loaded twice. That is
+    this pipeline's fault -- a file re-copied after the 64-day load history
+    expires, say -- and stopping is right, because nothing downstream can repair
+    it and a green run over it would be a lie.
+
+    A key whose loads carry DIFFERENT numbers is the provider revising a bar
+    after the fact. Nothing here is broken, nothing is lost by continuing, and
+    stg_prices keeps the newest load. Stopping the pipeline over it puts a red
+    DAG in front of someone who cannot fix the upstream data anyway -- the same
+    reasoning as the WARN half of the severity rule in dbt/models/_models.yml.
+
+    Measured 2026-09-11: the vwap revision that stopped this script produced 25
+    keys in the second category and none in the first.
+    """
+    cur.execute(f"""
+        WITH loads AS (
+            SELECT payload:ticker::string              AS ticker,
+                   payload:trade_date::date            AS trade_date,
+                   HASH(payload:open::float,
+                        payload:high::float,
+                        payload:low::float,
+                        payload:close::float,
+                        payload:volume::float,
+                        payload:vwap::float,
+                        payload:transactions::int)     AS bar_hash
+            FROM {database}.{RAW_SCHEMA}.{TABLE}
+        ),
+        per_key AS (
+            SELECT ticker, trade_date,
+                   COUNT(*)                 AS loads,
+                   COUNT(DISTINCT bar_hash) AS distinct_bars
+            FROM loads
+            GROUP BY 1, 2
+            HAVING COUNT(*) > 1
+        )
+        SELECT COUNT_IF(distinct_bars = 1)                          AS reloaded_keys,
+               COUNT_IF(distinct_bars > 1)                          AS revised_keys,
+               COALESCE(SUM(IFF(distinct_bars = 1, loads - 1, 0)), 0) AS reloaded_rows,
+               COALESCE(SUM(IFF(distinct_bars > 1, loads - 1, 0)), 0) AS revised_rows,
+               MIN(IFF(distinct_bars > 1, trade_date, NULL))        AS first_revised,
+               MAX(IFF(distinct_bars > 1, trade_date, NULL))        AS last_revised
+        FROM per_key
+    """)
+    row = cur.fetchone()
+    return {
+        "reloaded_keys": row[0],
+        "revised_keys": row[1],
+        "reloaded_rows": row[2],
+        "revised_rows": row[3],
+        "first_revised": str(row[4]) if row[4] else None,
+        "last_revised": str(row[5]) if row[5] else None,
+    }
+
+
 def list_stage(cur, database: str) -> tuple:
     """(file count, total bytes) currently visible under the stage."""
     cur.execute(f"LIST @{database}.{RAW_SCHEMA}.{STAGE}")
@@ -348,6 +406,13 @@ def run(dry_run: bool, verbose: bool) -> int:
         else:
             copy_result = run_copy(cur, database)
             after = measure(cur, database)
+
+        # Asked here, not below, because the connection is closed by the time
+        # the check runs -- and only when there is something to explain, so the
+        # ordinary run still costs exactly two queries.
+        duplicates = None
+        if after["rows_total"] != after["distinct_keys"]:
+            duplicates = classify_duplicates(cur, database)
     finally:
         conn.close()
 
@@ -366,16 +431,36 @@ def run(dry_run: bool, verbose: bool) -> int:
     print(f"range:       {after['first_day']} -> {after['last_day']}")
     print(f"manifest:    {manifest_path.relative_to(PROJECT_ROOT)}")
 
-    # The grain of this table is one row per ticker per trading day. If those
-    # two numbers ever diverge, the same file has been loaded twice -- which is
-    # exactly what happens to a file re-copied after the 64-day load history
-    # expires. Reporting a green run over that would be worse than failing.
-    if after["rows_total"] != after["distinct_keys"]:
-        die(f"{after['rows_total']:,} rows but only "
-            f"{after['distinct_keys']:,} distinct (ticker, trade_date) pairs.",
-            "The same file has been loaded more than once. Compare "
-            "source_file counts per (ticker, trade_date) before deleting "
-            "anything.")
+    # The grain of this table is one row per ticker per trading day, and when
+    # the row count and the key count diverge something has loaded twice. Until
+    # 2026-09-11 that ended the run. It should not always: a provider revising a
+    # number it already published also produces a second row, and on that date
+    # one did -- a vwap correction of a hundredth of a cent on seven tickers
+    # stopped the whole pipeline. So what happened is established before it is
+    # judged.
+    if duplicates:
+        if duplicates["revised_keys"]:
+            print(f"\nWARNING: {duplicates['revised_keys']} "
+                  f"(ticker, trade_date) key(s) have more than one load "
+                  f"carrying DIFFERENT numbers "
+                  f"({duplicates['revised_rows']:,} extra row(s), "
+                  f"{duplicates['first_revised']} -> "
+                  f"{duplicates['last_revised']}).")
+            print("         The provider revised bars it had already published. "
+                  "stg_prices keeps")
+            print("         the newest load per key; nothing here needs fixing. "
+                  "To see what")
+            print("         changed, compare the loads for one of those days by "
+                  "loaded_at.")
+
+        if duplicates["reloaded_keys"]:
+            die(f"{duplicates['reloaded_keys']} (ticker, trade_date) key(s) "
+                f"have more than one load carrying IDENTICAL numbers "
+                f"({duplicates['reloaded_rows']:,} extra row(s)).",
+                "The same file has been loaded more than once. This is not a "
+                "provider revision -- the bars are unchanged. Compare "
+                "source_file and loaded_at per (ticker, trade_date) before "
+                "deleting anything.")
 
     return 0
 

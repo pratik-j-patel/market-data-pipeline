@@ -26,10 +26,22 @@ models:
     description: >
       Daily equity bars, typed. One row per ticker per trading day, every price
       and volume column cast explicitly rather than inferred. Carries the raw
-      table's lineage columns through unchanged. Deliberately not deduplicated,
-      which is what gives the uniqueness test below something real to catch.
+      table's lineage columns through unchanged.
+
+      Deduplicated only where the provider revised a bar it had already
+      published: when two loads of a key carry different numbers the newest
+      wins, and when they carry identical numbers both are kept. That second
+      half is what still gives the uniqueness test below something real to
+      catch.
 
     columns:
+      - name: bar_hash
+        description: >
+          A fingerprint of the seven numbers the provider sends, and of nothing
+          else -- the lineage columns are excluded because they differ between
+          two loads of the same bar by construction. It is what lets a revision
+          be told apart from a re-load in SQL rather than by hand.
+
       - name: price_key
         description: ticker and trade_date joined -- the grain as a single column.
         data_tests:
@@ -49,9 +61,18 @@ models:
           # loaded. This is that check, promoted from a script to the layer that
           # owns the invariant.
           #
-          # And it can only work because stg_prices does not deduplicate. A
-          # `qualify row_number() = 1` upstream would leave this test
+          # It can only work because stg_prices does not BLINDLY deduplicate.
+          # A bare `qualify row_number() = 1` upstream would leave this test
           # permanently, uselessly green over a real load fault.
+          #
+          # UPDATED 2026-09-11. stg_prices now does deduplicate -- but only a
+          # key whose loads carry DIFFERENT bars, which is a provider revision
+          # rather than a fault. Loads carrying IDENTICAL bars are still kept,
+          # and still fail here. That is the distinction the original version
+          # could not draw: on 2026-09-11 a vwap correction of one hundredth of
+          # a cent on seven tickers produced 25 duplicate rows and stopped the
+          # pipeline over something no reader would ever have seen. This test
+          # keeps the case it was written for and loses the false alarm.
           - unique:
               config:
                 severity: error

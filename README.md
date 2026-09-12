@@ -144,8 +144,8 @@ The fix is in the merge, not in the warehouse. A row whose bar came back unchang
 original `ingested_at_utc`, and a day file whose content is unchanged is not rewritten at all —
 so unchanged bytes now propagate all the way down. `ingested_at_utc` means *first seen, or last
 seen to change*; when a row last reached the warehouse is a different question, and
-`raw_prices.loaded_at` answers it. Deduplicating in the staging model would also have made the
-symptom go away, in one line, which is the same objection as the one below.
+`raw_prices.loaded_at` answers it. Blindly deduplicating in the staging model would also have made
+the symptom go away, in one line — see below for why that turned out to be only half right.
 
 ---
 
@@ -385,13 +385,31 @@ so a schema inferred from the head of the file types five FLOAT columns as INTEG
 absorbed it; the hand-written `::float` casts in the staging model resolved it. Verified in
 `information_schema`: that column is FLOAT and the value is 229.
 
-**No deduplication in staging.** A `qualify row_number() over (partition by price_key ...) = 1`
-would be one line and would guarantee this table always looks correct. That is the objection to
-it. The duplicate it silently absorbed would be a real load fault upstream, and the uniqueness
-test — whose entire purpose is to catch exactly that — would be permanently, uselessly green.
-The staging layer's job is to make raw data typed and legible, not to make it look clean. That
-test now exists, and the decision to leave this table undeduplicated is what gives it anything
-to find.
+**Deduplication in staging, but only for revisions.** A bare
+`qualify row_number() over (partition by price_key ...) = 1` would be one line and would guarantee
+this table always looks correct. That is the objection to it: the duplicate it silently absorbs
+might be a real load fault, and the uniqueness test — whose entire purpose is to catch exactly
+that — would be permanently, uselessly green.
+
+So for most of this project the table deduplicated nothing at all. That assumed every duplicate
+means the same thing, and on 2026-09-11 one did not. The provider revised its volume-weighted
+average price for 2026-09-08 on seven of twenty-five tickers, by between one and seven
+ten-thousandths of a dollar. The file's bytes changed, so S3 re-uploaded it, so Snowflake
+re-copied it whole, so twenty-five rows arrived a second time and the pipeline stopped — over a
+correction of one hundredth of a cent that nothing downstream would have rendered differently.
+
+Stopping was wrong there. Stopping is still right when a file is genuinely loaded twice. So the
+two cases are now separated rather than treated alike. Loads of a key carrying the **same** bar
+are all kept, because the file really was loaded twice and the uniqueness test should fail. Loads
+carrying **different** bars collapse to the newest, because the provider revised the number and
+the newest load is what S3 holds. The comparison is a hash of the seven numbers the provider
+sends and of nothing else — the lineage columns differ between two loads of the same bar by
+construction, so including them would make every pair look different and defeat the whole thing.
+
+`scripts/snowflake_copy.py` draws the same line one layer earlier: identical reloads still exit
+non-zero, revisions print a warning and let the build continue. The severity rule the dbt tests
+follow — a broken grain errors, a strange number warns — turns out to have been the right
+question all along. It was being asked of the wrong thing.
 
 **A table, not a view.** dbt's convention for a staging layer is a view. I chose a table: the
 step's definition of done was one clean table, the storage is kilobytes, and both marts models

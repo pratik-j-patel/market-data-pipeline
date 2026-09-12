@@ -90,20 +90,57 @@ keyed as (
         -- here means that test is four lines of YAML instead of an extra
         -- package dependency.
         ticker || '|' || trade_date::varchar       as price_key,
+
+        -- A fingerprint of the BAR -- the seven numbers the provider sends --
+        -- and deliberately not of the lineage columns, which differ between two
+        -- loads of the same bar by construction. This is what makes the
+        -- difference between "this file was loaded twice" and "the provider
+        -- revised a number" a thing SQL can see, rather than something only a
+        -- person comparing rows by hand can.
+        hash(open, high, low, close, volume, vwap, transaction_count)
+                                                   as bar_hash,
         typed.*
 
     from typed
 
 )
 
--- Deliberately NOT deduplicated.
+-- DEDUPLICATED ONLY WHERE THE PROVIDER CHANGED SOMETHING.
 --
--- A `qualify row_number() over (partition by price_key ...) = 1` here would be
--- one line and would guarantee this table always looks correct. That is the
--- problem with it. The duplicate it silently absorbed would be a real load
--- fault upstream, and the uniqueness test on this column -- the whole point of which
--- is to notice exactly that -- would be permanently, uselessly green.
+-- This model used to deduplicate nothing at all, and the argument for it was
+-- good: a bare `qualify row_number() = 1` guarantees this table always looks
+-- correct, and the duplicate it silently absorbs would be a real load fault --
+-- leaving the uniqueness test on price_key permanently, uselessly green.
 --
--- The staging layer's job is to make the raw data typed and legible. It is not
--- to make it look clean.
+-- That argument assumed every duplicate means the same thing. On 2026-09-11 one
+-- did not. The provider revised its volume-weighted average price for
+-- 2026-09-08 on seven of twenty-five tickers, by between one and seven
+-- ten-thousandths of a dollar. That changed the file's bytes, so S3 re-uploaded
+-- it, so Snowflake re-copied it whole, so twenty-five rows arrived a second time
+-- and the pipeline stopped -- over a correction of one hundredth of a cent that
+-- no reader of this data would ever have seen.
+--
+-- Stopping was wrong there. Stopping is still right when a file is genuinely
+-- loaded twice. So the two cases are separated rather than treated alike:
+--
+--   every load of a key carries the SAME bar  ->  keep them all.
+--       The file really was loaded twice; nothing upstream changed, so there is
+--       nothing to absorb. The uniqueness test below still fails, which is what
+--       it is for and what it caught on 2026-09-07.
+--
+--   the loads carry DIFFERENT bars            ->  keep the newest.
+--       The provider revised the number. The newest load is what S3 holds and
+--       what the file on disk says, so it is what this table should agree with.
+--
+-- min(...) = max(...) rather than count(distinct ...): Snowflake does not accept
+-- DISTINCT inside a window function, and when every value in a partition is
+-- equal its minimum and maximum are the same value. A hash collision between two
+-- genuinely different bars would keep both rows and fail the test -- a false
+-- alarm rather than a silent pass, which is the correct direction to be wrong in.
 select * from keyed
+qualify
+    equal_null(
+        min(bar_hash) over (partition by price_key),
+        max(bar_hash) over (partition by price_key)
+    )
+    or row_number() over (partition by price_key order by loaded_at desc) = 1
