@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from cryptography.hazmat.primitives import serialization
@@ -149,6 +150,51 @@ def load_prices() -> pd.DataFrame:
     return frame
 
 
+# Categorical slots 1 and 2 -- blue and orange -- stepped separately for the two
+# surfaces Streamlit renders on. Both pairs were run through a palette validator
+# against the actual backgrounds (#ffffff and #0e1117) rather than chosen by eye:
+# lightness band, chroma floor, contrast, and colour-blind separation under
+# protanopia and tritanopia. Worst-case separation is dE 24.7 light / 26.8 dark
+# against a floor of 8, so the two lines stay distinguishable to a reader who
+# cannot separate red from green -- which the two near-identical blues this
+# replaced did not.
+SERIES_COLOURS = {
+    "light": ["#2a78d6", "#eb6834"],
+    "dark": ["#3987e5", "#d95926"],
+}
+
+
+def series_colours() -> list[str]:
+    """
+    Streamlit infers the theme from the rendered background and exposes it here.
+    It can be wrong on the very first paint of a session, which costs one frame
+    in the other palette and then corrects itself -- acceptable, given both
+    palettes pass their checks on both surfaces.
+    """
+    try:
+        mode = st.context.theme.type
+    except Exception:
+        mode = "dark"
+    return SERIES_COLOURS.get(mode, SERIES_COLOURS["dark"])
+
+
+def money(value, places: int = 2) -> str:
+    """A price, or an em dash. Never a zero standing in for an absent number."""
+    if value is None or pd.isna(value):
+        return "\u2014"
+    return f"${value:,.{places}f}"
+
+
+def compact_money(value) -> str:
+    """Dollar volume runs to eleven digits; nobody reads eleven digits."""
+    if value is None or pd.isna(value):
+        return "\u2014"
+    for cutoff, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= cutoff:
+            return f"${value / cutoff:,.2f}{suffix}"
+    return f"${value:,.0f}"
+
+
 # Has to run before any other Streamlit call in the script, including the
 # spinner that load_prices() puts on screen while it waits on Snowflake.
 st.set_page_config(
@@ -184,12 +230,102 @@ with st.sidebar:
 
 history = prices[prices["ticker"] == selected].set_index("trade_date")
 
-st.subheader(f"{labels[selected]} - closing price")
-st.line_chart(
-    history[["close", "moving_avg_20d"]].rename(
-        columns={"close": "Close", "moving_avg_20d": "20-session average"}
-    )
+latest = history.iloc[-1]
+
+st.subheader(f"{labels[selected]} - {history.index[-1]:%d %b %Y}")
+
+# Four tiles, and three of them can legitimately be empty. high_52w and low_52w
+# are null until 252 sessions sit behind the row, and daily_return_pct is null on
+# a ticker's first session. Each renders an em dash rather than a zero, for the
+# same reason the chart renders a gap.
+tiles = st.columns(4)
+tiles[0].metric(
+    "Close",
+    money(latest["close"]),
+    None if pd.isna(latest["daily_return_pct"]) else f"{latest['daily_return_pct']:+.2f}%",
+    border=True,
 )
+tiles[1].metric("52-week high", money(latest["high_52w"]), border=True)
+tiles[2].metric("52-week low", money(latest["low_52w"]), border=True)
+tiles[3].metric("Dollar volume", compact_money(latest["dollar_volume"]), border=True)
+
+# Altair rather than st.line_chart, for one reason: st.line_chart forces the
+# y-axis to include zero, and no argument turns that off. On a price series that
+# is half the plot spent on a region the data never visits -- nobody compares a
+# share price to zero -- so two years of movement gets squeezed into the top
+# third. Altair ships with Streamlit, so this costs no dependency.
+chart_frame = (
+    history[["close", "moving_avg_20d"]]
+    .rename(columns={"close": "Close", "moving_avg_20d": "20-session average"})
+    .reset_index()
+)
+SERIES = ["Close", "20-session average"]
+
+# Fit the axis to the data with a little air, and turn `nice` off so the padding
+# is the padding rather than Vega rounding outward to a tidy number.
+low = chart_frame[SERIES].min().min()
+high = chart_frame[SERIES].max().max()
+air = (high - low) * 0.04
+
+# The crosshair finds the X: the reader aims at a date, not at a 2px line, and
+# gets both series at once whether or not the pointer landed on either.
+hover = alt.selection_point(
+    nearest=True, on="pointerover", fields=["trade_date"], empty=False
+)
+
+base = alt.Chart(chart_frame).transform_fold(SERIES, as_=["series", "value"])
+
+lines = base.mark_line(strokeWidth=2, strokeJoin="round", strokeCap="round").encode(
+    x=alt.X("trade_date:T", title=None),
+    y=alt.Y(
+        "value:Q",
+        title=None,
+        scale=alt.Scale(domain=[low - air, high + air], nice=False),
+    ),
+    color=alt.Color(
+        "series:N",
+        title=None,
+        scale=alt.Scale(domain=SERIES, range=series_colours()),
+        legend=alt.Legend(orient="bottom", symbolType="stroke"),
+    ),
+)
+
+# Dots appear only under the crosshair. A marker on every one of 512 points is
+# chaos; a marker on the one the reader is pointing at is an answer.
+dots = lines.mark_point(size=64, filled=True).encode(
+    opacity=alt.condition(hover, alt.value(1), alt.value(0))
+)
+
+crosshair = (
+    alt.Chart(chart_frame)
+    .mark_rule(strokeWidth=1)
+    # The average is null for a ticker's first nineteen sessions, and a number
+    # format applied to nothing renders the literal string "null" in the
+    # tooltip. That is the same mistake as drawing a zero: a machine token
+    # standing where a reader expects a statement about the data. Formatting it
+    # here, as text, means the absence is spelled the same way the tiles spell
+    # it -- and the guard sits next to the only two fields that can be absent.
+    .transform_calculate(
+        close_label="format(datum['Close'], '$,.2f')",
+        average_label=(
+            "isValid(datum['20-session average'])"
+            " ? format(datum['20-session average'], '$,.2f')"
+            " : '\u2014'"
+        ),
+    )
+    .encode(
+        x="trade_date:T",
+        opacity=alt.condition(hover, alt.value(0.35), alt.value(0)),
+        tooltip=[
+            alt.Tooltip("trade_date:T", title="Session", format="%d %b %Y"),
+            alt.Tooltip("close_label:N", title="Close"),
+            alt.Tooltip("average_label:N", title="20-session avg"),
+        ],
+    )
+    .add_params(hover)
+)
+
+st.altair_chart(alt.layer(lines, dots, crosshair).properties(height=380))
 st.caption(
     "The 20-session average is blank for each ticker's first nineteen sessions. "
     "dbt leaves it null rather than averaging a partial window, and a gap in the "

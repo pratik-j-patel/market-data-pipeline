@@ -2,8 +2,7 @@
 
 Every step before this one moved data toward a shape somebody could look at.
 This is the looking. The dashboard is a Streamlit app: a Python file that reads
-a table and draws it, where the drawing code is `st.line_chart(frame)` rather
-than a chart library's object model.
+a table and draws it, top to bottom, with no callbacks and no component tree.
 
 It reads `marts.fct_daily_prices` joined to `marts.dim_tickers` on `ticker`, and
 nothing else. Not the staging model, not the raw VARIANT table. That join is the
@@ -96,6 +95,38 @@ because a zero would be a claim that the price was zero.
 
 The same is true of the 52-week high and low, which are null across roughly half
 the history for the same reason.
+
+## Why the chart is Altair and not `st.line_chart`
+
+`st.line_chart` is one line and it was the first version of this page. It has one
+limit that matters here: it forces the y-axis to include zero, and no argument
+turns that off. Apple traded between roughly 180 and 345 over the window, so half
+the plot was spent on a region the data never visits and the entire two-year
+shape was compressed into the top third. Nobody compares a share price to zero.
+
+Altair ships as a Streamlit dependency, so replacing that one call costs no new
+package. The chart sets its own y-domain from the data with four percent of air
+on each side and `nice: False`, so the padding stays the padding instead of Vega
+rounding outward to a tidy number.
+
+Three other things came with the switch, and each is a decision rather than a
+default:
+
+- **The crosshair finds the date.** A vertical rule snaps to the nearest session
+  and both series report at once. The reader aims at a date, not at a two-pixel
+  line, and never has to land on a line to get its value.
+- **Markers appear only under the crosshair.** A dot on every one of five hundred
+  points is noise; a dot on the one being pointed at is an answer.
+- **The tooltip formats the average as text, not as a number.** A number format
+  applied to a null renders the literal string `null`, which is the same mistake
+  as drawing a zero -- a machine token standing where a reader expects a
+  statement about the data. It renders an em dash, the way the tiles do.
+
+The line colours are categorical slots one and two of a validated palette,
+stepped separately for light and dark backgrounds, and the app reads Streamlit's
+theme to choose. They were checked against both surfaces for lightness, chroma,
+contrast, and separation under protanopia and tritanopia rather than picked by
+eye: the first version used two blues that were nearly indistinguishable.
 
 ## Why the app pulls all twenty-five tickers at once
 
