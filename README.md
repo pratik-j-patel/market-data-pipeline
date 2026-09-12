@@ -1,8 +1,16 @@
 # Market Data Pipeline
 
-A daily batch pipeline for US equity prices: **API → local partitions → S3 → Snowflake → dbt**.
+A daily batch pipeline for US equity prices:
+**API → local partitions → S3 → Snowflake → dbt → Streamlit**.
 Two years of daily bars for 25 large-cap tickers, landed once and reloadable from scratch in
 about twenty minutes.
+
+### ▶ [daily-equity-pipeline.streamlit.app](https://daily-equity-pipeline.streamlit.app)
+
+The dashboard reads the marts layer as a Snowflake `SERVICE` user — an account type that cannot
+hold a password at all — whose role can `SELECT` from two tables and nothing else. It cannot see
+the staging model, cannot see the raw table its own data came from, and cannot write anywhere.
+`scripts/check_dashboard_grants.py` demonstrates that rather than asserting it.
 
 Everything below has been run. The numbers are measured, not estimated.
 

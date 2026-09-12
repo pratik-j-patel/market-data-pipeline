@@ -31,6 +31,7 @@ Run sql/07_dashboard_reader_role.sql FIRST -- the ALTER USER this prints has
 nothing to attach to until the user exists.
 
 Usage:  python scripts/set_dashboard_profile.py
+        python scripts/set_dashboard_profile.py --cloud
 """
 
 import base64
@@ -122,7 +123,72 @@ def write_config(path, text):
     os.replace(temp, path)
 
 
+def emit_cloud_config():
+    """
+    Build the Streamlit Community Cloud secrets block and put it on the clipboard.
+
+    The runner has no ~/.snowflake, so the key cannot be referenced by path: it
+    has to travel as text, pasted into a web form. That is the one moment in this
+    project where a private key leaves the machine, and the rule the rest of the
+    project follows applies hardest here -- build it to the clipboard, never draw
+    it on screen. A rendered key is one screenshot away from a rotation, and this
+    project has already paid that bill five times.
+
+    Nothing is printed but a line count.
+    """
+    if not os.path.exists(OUT_PATH):
+        die(f"{OUT_PATH} does not exist. Run this without --cloud first.")
+
+    import tomllib
+
+    with open(OUT_PATH, "rb") as handle:
+        config = tomllib.load(handle)["snowflake"]
+
+    key_path = os.path.expanduser(config.get("private_key_path", ""))
+    if not os.path.exists(key_path):
+        die(f"the private key named in {OUT_PATH} does not exist at {key_path}")
+    with open(key_path) as handle:
+        pem = handle.read().strip()
+
+    lines = [
+        "[snowflake]",
+        f"account = {toml_string(config['account'])}",
+        f"user = {toml_string(config['user'])}",
+        f"role = {toml_string(config['role'])}",
+        f"warehouse = {toml_string(config['warehouse'])}",
+        f"database = {toml_string(config['database'])}",
+        f"schema = {toml_string(config['schema'])}",
+        f"private_key_passphrase = {toml_string(config['private_key_passphrase'])}",
+        # A TOML multi-line string. The leading newline after the opening quotes
+        # is swallowed by TOML itself, so the PEM arrives byte-identical.
+        'private_key_pem = """',
+        pem,
+        '"""',
+    ]
+    blob = "\n".join(lines) + "\n"
+
+    try:
+        subprocess.run(["pbcopy"], input=blob.encode(), check=True)
+    except Exception:
+        die("could not reach pbcopy. Run this in a terminal on this Mac.")
+
+    print()
+    # len(lines) counts the pieces this was assembled from, and the key is one
+    # piece spanning many lines -- which reported "11 lines" for a 35-line blob.
+    # A number that does not mean what it says is worse than no number.
+    print(f"  {blob.count(chr(10))} lines are on your clipboard, including the private key.")
+    print(f"  user {config['user']} / role {config['role']} / warehouse {config['warehouse']}")
+    print()
+    print("  Paste it into the app's Secrets box in Streamlit Community Cloud.")
+    print("  Nothing was printed here on purpose. Do not paste it anywhere else,")
+    print("  and clear your clipboard afterwards by copying something harmless.")
+
+
 def main():
+    if "--cloud" in sys.argv[1:]:
+        emit_cloud_config()
+        return
+
     if os.path.exists(KEY_PATH):
         die(
             f"{KEY_PATH} already exists.\n"
