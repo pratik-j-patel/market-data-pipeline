@@ -1,0 +1,31 @@
+# Dependencies for the dashboard only.
+#
+# This file is separate from the one at the repository root on purpose. Streamlit
+# Community Cloud installs whatever requirements file sits beside the app it is
+# told to run, and the root file pins dbt-core, dbt-snowflake and boto3 -- the
+# ingestion and transformation stack, none of which the dashboard imports.
+# Pointing the deployment at that file would have the free-tier runner build the
+# whole pipeline in order to draw a line chart.
+
+streamlit==1.63.0
+
+# The [pandas] extra is what makes cursor.fetch_pandas_all() available: it adds
+# pandas and pyarrow, and Snowflake returns Arrow batches that convert into a
+# dataframe without a Python-level row loop. Without the extra the connector
+# still works and that one method does not.
+#
+# 4.7.3 is not an independent choice. dbt-snowflake 1.12.0 -- pinned in the root
+# requirements file -- already requires snowflake-connector-python >=4.2.0,<5.0.0
+# and installs it into the same virtual environment. Matching the version here
+# keeps one connector in that venv rather than two fighting over it, and the
+# extra installs alongside a connector that is already present.
+#
+# The extra also caps pandas below 3.0. That cap is inherited, not chosen, and it
+# is a good one to inherit: pandas 3 is new and nothing here needs it.
+snowflake-connector-python[pandas]==4.7.3
+
+# cryptography is not listed. It arrives with the connector, and dashboard/app.py
+# imports it only to turn the PEM private key into the DER bytes the connector
+# asks for -- the same library scripts/set_dbt_profile.py used to generate that
+# key in the first place. Listing it here would pin a transitive dependency of a
+# package pinned two lines up, which is how version conflicts get built by hand.

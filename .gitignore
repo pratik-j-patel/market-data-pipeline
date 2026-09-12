@@ -61,3 +61,15 @@ rsa_key*
 # it is missing, and `git add .` would take it without asking.
 airflow/config/
 airflow/plugins/
+
+# The dashboard's Snowflake credentials, written by
+# scripts/set_dashboard_profile.py at mode 600. It carries the private key's
+# passphrase. The `secrets*` pattern further up already catches this path -- the
+# line is repeated here so that the reason sits next to the file it protects.
+#
+# There is deliberately NO committed template beside it. A file named
+# secrets.toml.example is caught by scripts/check_secrets.sh, which refuses any
+# staged path containing "secrets" whatever is inside it -- and that refusal is
+# worth more than the convenience of a template. The two shapes the template
+# would have shown are written out in docs/dashboard_setup.md instead.
+.streamlit/secrets.toml

@@ -38,7 +38,7 @@ flowchart TD
     STG["Snowflake <code>staging.stg_prices</code><br/><i>one typed row per ticker per day</i>"]
     SEED["<code>dbt/seeds/ticker_reference.csv</code><br/><i>25 rows · company name + GICS sector</i>"]
     MARTS["Snowflake <code>marts</code><br/><code>dim_tickers</code> · <code>fct_daily_prices</code><br/><i>star schema · 25 tickers × every session</i>"]
-    DASH["Streamlit dashboard<br/><i>not built yet — step 12</i>"]
+    DASH["Streamlit dashboard<br/><i>reads the star schema · one cached query per hour</i>"]
 
     AF -.->|"four tasks, in order"| API
     API -->|"<b>fetch_tickers.py</b><br/>trailing window · merge on (trade_date, ticker)"| LOCAL
@@ -47,7 +47,7 @@ flowchart TD
     RAW -->|"<b>dbt build</b><br/>hand-written type casts, then 25 tests"| STG
     STG -->|"<b>dbt build</b><br/>window functions, partitioned by ticker"| MARTS
     SEED -->|"<b>dbt build</b><br/>loads the one thing the API cannot send"| MARTS
-    MARTS -.-> DASH
+    MARTS -->|"<b>dashboard/app.py</b><br/>one query for all 25 tickers, cached an hour, filtered in pandas"| DASH
 ```
 
 An Airflow DAG runs those four stages every weekday morning, calling the same scripts a person
@@ -386,8 +386,8 @@ test now exists, and the decision to leave this table undeduplicated is what giv
 to find.
 
 **A table, not a view.** dbt's convention for a staging layer is a view. I chose a table: the
-step's definition of done was one clean table, the storage is kilobytes, and the dashboard in
-step 12 reads this object on every page load. If that calculus changes it is one word in
+step's definition of done was one clean table, the storage is kilobytes, and both marts models
+read this object on every build. If that calculus changes it is one word in
 `dbt_project.yml`.
 
 **`raw_prices` is declared as a dbt source, not a hard-coded three-part name.** Lineage then
@@ -616,11 +616,7 @@ back. A 200 means the message arrived, not that the server did what was asked.
 
 ## What I would do next
 
-In the order I intend to build them:
-
-1. **A Streamlit dashboard**, reading `marts.fct_daily_prices` joined to `marts.dim_tickers` on
-   `ticker` — which is the whole reason those two tables exist.
-2. **Orchestration somewhere that is not my laptop.** See below; a scheduled GitHub Actions
+**Orchestration somewhere that is not my laptop.** See below; a scheduled GitHub Actions
    workflow would do it for free on a public repo, and the tasks already shell out to scripts
    rather than importing them, which is most of the work.
 
