@@ -11,9 +11,10 @@ past the marts to fix something is a dashboard reporting a missing mart.
 
 ## What you need before starting
 
-- `~/.dbt/profiles.yml` already written by `scripts/set_dbt_profile.py`, with a
-  working key pair. The dashboard does not set up its own authentication; it
-  reuses what dbt proved.
+- `~/.dbt/profiles.yml` already written by `scripts/set_dbt_profile.py`. The
+  dashboard does not reuse that credential -- it gets its own -- but the account
+  identifier is read from there so it does not have to be typed twice.
+- `sql/07_dashboard_reader_role.sql` run in Snowsight as ACCOUNTADMIN.
 - The marts built at least once, so `dim_tickers` and `fct_daily_prices` exist.
 - The project venv. A fresh Terminal starts in conda's `base`, which is a
   different Python.
@@ -44,31 +45,61 @@ And its version is pinned to match what dbt-snowflake already installed into the
 same virtual environment, so there is one connector in there rather than two
 arguing about which one wins.
 
-## 2. Connection
+## 2. The identity the dashboard connects as
+
+Everything up to this point in the project ran as one Snowflake user holding
+ACCOUNTADMIN. That is defensible while the only thing holding the credential is a
+laptop. It stops being defensible the moment a key is pasted into a hosting
+provider's configuration for an app anyone can open, because the blast radius of
+a leak becomes the whole account.
+
+So the dashboard gets its own identity. `sql/07_dashboard_reader_role.sql`
+creates a `dash_wh` warehouse, a `dashboard_reader` role granted `SELECT` on the
+marts schema and nothing else, and a `dashboard_app` user to hold that role.
+
+That user is created with `TYPE = SERVICE`, which is the part worth reading
+twice. Snowflake's service users cannot log in with a password and cannot log in
+with SAML -- not by policy, but because the account type has nowhere to put a
+password. A credential that does not exist cannot be phished, guessed, reused
+from another site, or left in a screenshot. It also means the user cannot be
+tested in Snowsight at all, which is why section 4 exists.
+
+Then generate its key pair:
 
 ```
 cd ~/Projects/market-data-pipeline
 python scripts/set_dashboard_profile.py
 ```
 
-This writes `.streamlit/secrets.toml`, which is where Streamlit looks for
-configuration when the app is launched from the repository root. It is ignored
-by git and the script sets it to mode 600.
+This writes `.streamlit/secrets.toml` -- where Streamlit looks when the app is
+launched from the repository root, ignored by git, mode 600 -- and puts an
+`ALTER USER ... SET RSA_PUBLIC_KEY` statement on the clipboard to run in
+Snowsight. It goes to the clipboard rather than the screen because the statement
+is around four hundred characters, and selecting a line that long out of a
+terminal is how it arrives truncated.
 
-It derives every value from `~/.dbt/profiles.yml` rather than prompting, and the
-reason is the passphrase. `set_dbt_profile.py` generated that passphrase instead
-of asking you to choose one, specifically so it would never have to be typed.
-Prompting for it here would undo that: it would land in a terminal buffer, and
-possibly in a shell history file, for no gain over reading it off a file that is
-already on the disk with the right permissions.
-
-The script chmods the file after writing and then re-reads the mode and refuses
-to report success unless it is 600. That assertion exists because of a real
-failure: the mode argument to `os.open` is a *creation* mode, and when the path
-already exists it is ignored entirely, so the file silently keeps whatever
+The passphrase is generated rather than chosen, so it is never typed and cannot
+be one reused from somewhere else. The private key and the config are both
+created with `O_EXCL` at mode 600, and the script re-reads the mode afterwards
+and refuses to report success unless it is 600. Both halves exist because of a
+real failure: the mode argument to `os.open` is a *creation* mode, and when the
+path already exists it is ignored entirely, so the file silently keeps whatever
 permissions it had. A leftover file at that path is enough to publish a
 passphrase to every account on the machine, and nothing else in the flow would
-have noticed.
+notice. `O_EXCL` removes the question by refusing to open an existing path at all.
+
+### Checking the key landed
+
+`DESC USER dashboard_app;` shows an `RSA_PUBLIC_KEY_FP` row -- a SHA-256 hash of
+the public key -- which should equal the fingerprint the script printed. Do not
+compare them by eye. They are base64, and lowercase `l` and uppercase `I` are the
+same pixels in most fonts; that mistake has already been made once here, by the
+person who had just finished warning against it.
+
+The stronger check needs no reading at all. Key-pair authentication works by the
+client signing a token with the private key and Snowflake verifying it with the
+public key it holds, and if those do not match, authentication fails outright.
+So a successful connection *is* the proof -- and section 4 makes one.
 
 ## 3. Run it
 
@@ -79,6 +110,36 @@ streamlit run dashboard/app.py
 
 It opens on `localhost:8501`. The first load wakes the warehouse, so expect a
 few seconds before anything appears; after that, changing tickers is instant.
+
+## 4. Prove the role is actually restricted
+
+```
+cd ~/Projects/market-data-pipeline
+python scripts/check_dashboard_grants.py
+```
+
+`sql/07_dashboard_reader_role.sql` says what `dashboard_reader` is allowed to do,
+and this file could say the same thing. Neither is evidence. A `GRANT` that was
+never run, a schema added later, or the role granted somewhere unexpected all
+leave the prose looking correct. This script connects as the real user over the
+real path and asks the warehouse, which is also the only way to test a `SERVICE`
+user at all.
+
+Two things about how it is built:
+
+**The readable tables are checked first, and they are the canary.** A test that
+only checks "staging is refused" passes just as happily when the connection is
+broken and everything is refused. If the two marts reads fail, the script reports
+`INCONCLUSIVE` rather than `PASS` -- it will not claim the refusals proved
+anything.
+
+**It also tries to create a table in marts.** `SELECT`-only is a different claim
+from "cannot see staging", and a role can be scoped to the right schema and still
+be able to write in it.
+
+Measured 2026-09-12: 12,800 rows readable in `fct_daily_prices`, 25 in
+`dim_tickers`, `staging.stg_prices` and `raw.raw_prices` both refused, and
+`CREATE TABLE` in marts refused.
 
 ## What the page shows, and one thing that looks like a bug
 
@@ -161,16 +222,12 @@ contents of the `.p8` file — header and footer lines included, exactly as they
 appear on disk. `dashboard/app.py` accepts either form and converts both to the
 DER bytes the connector wants, so nothing else changes.
 
-Two things to settle before the app is public:
+The app connects as `dashboard_app`, not as the dbt user -- see section 2. What
+travels to Streamlit is a key that can read two tables.
 
-**The account it connects as.** The dbt profile connects with a role that has
-far more authority than a dashboard needs. A deployed app should have its own
-Snowflake user with its own key pair and a role granted `SELECT` on the marts
-schema and nothing else. The app cannot write, so nothing is lost.
-
-**What happens when the warehouse is gone.** A deployed app that cannot reach
-Snowflake shows an error, not a blank page. If the account is suspended — a
-trial ending, say — the app goes dark until it is reachable again.
+**A deployed app that cannot reach Snowflake shows an error, not a blank page.**
+If the account is suspended — a trial ending, say — the app goes dark until it is
+reachable again.
 
 ## What is missing
 
