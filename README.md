@@ -7,6 +7,10 @@ about twenty minutes.
 
 ### ▶ [daily-equity-pipeline.streamlit.app](https://daily-equity-pipeline.streamlit.app)
 
+[![One ticker's closing price and 20-session average over two years, with the 52-week range and dollar volume above the chart](docs/images/dashboard.png)](https://daily-equity-pipeline.streamlit.app)
+
+*The live app on 13 Sep 2026, showing the session of 10 Sep.*
+
 The dashboard reads the marts layer as a Snowflake `SERVICE` user — an account type that cannot
 hold a password at all — whose role can `SELECT` from two tables and nothing else. It cannot see
 the staging model, cannot see the raw table its own data came from, and cannot write anywhere.
@@ -626,7 +630,8 @@ sql/                    The Snowflake side: warehouse, storage integration, stag
 aws/                    IAM policy and trust policy documents, with the bootstrap version kept.
 dbt/                    dbt project: one source, a staging model, a seed, the marts star,
                         and 25 tests. Singular tests live in dbt/tests/.
-docs/                   Runbooks for the two stages that involve a console: Snowflake and dbt.
+docs/                   Runbooks for the three stages that involve a console: Snowflake, dbt
+                        and the dashboard deploy. Screenshots live under docs/images/.
 notebooks/              How each step was worked out, with outputs kept as evidence.
 scripts/                Credential setup, the Snowflake load, the secret scanner, the hook installer.
 ```
