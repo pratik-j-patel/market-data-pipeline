@@ -105,7 +105,7 @@ keyed as (
 
 )
 
--- DEDUPLICATED ONLY WHERE THE PROVIDER CHANGED SOMETHING.
+-- DEDUPLICATED ONLY WHERE THE PROVIDER CHANGED SOMETHING -- ASKED PER FILE.
 --
 -- This model used to deduplicate nothing at all, and the argument for it was
 -- good: a bare `qualify row_number() = 1` guarantees this table always looks
@@ -120,27 +120,66 @@ keyed as (
 -- and the pipeline stopped -- over a correction of one hundredth of a cent that
 -- no reader of this data would ever have seen.
 --
--- Stopping was wrong there. Stopping is still right when a file is genuinely
--- loaded twice. So the two cases are separated rather than treated alike:
+-- So the two cases were separated. But they were separated per KEY, and that
+-- was one layer off, which 2026-09-14 proved: a revision on 2026-09-09 and
+-- 2026-09-10 moved 15 bars, and COPY brought the other 35 rows of those two day
+-- files back UNCHANGED. Asked per key, those 35 look exactly like a file loaded
+-- twice for no reason. They are not. They are passengers.
 --
---   every load of a key carries the SAME bar  ->  keep them all.
---       The file really was loaded twice; nothing upstream changed, so there is
---       nothing to absorb. The uniqueness test below still fails, which is what
---       it is for and what it caught on 2026-09-07.
+-- A COPY reloads a FILE, so the file is the unit that has to be judged:
 --
---   the loads carry DIFFERENT bars            ->  keep the newest.
---       The provider revised the number. The newest load is what S3 holds and
---       what the file on disk says, so it is what this table should agree with.
+--   nothing in the file changed  ->  keep every load of every key in it.
+--       The file really was loaded twice and nothing upstream changed, so there
+--       is nothing to absorb. The uniqueness test below still fails, which is
+--       what it is for and what it caught on 2026-09-07.
+--
+--   anything in the file changed ->  keep the newest load of each key in it.
+--       The provider revised at least one bar and the whole file came back with
+--       it. The newest load is what S3 holds and what the file on disk says, so
+--       it is what this table should agree with -- for the revised bars and for
+--       the unchanged ones that travelled with them alike.
 --
 -- min(...) = max(...) rather than count(distinct ...): Snowflake does not accept
 -- DISTINCT inside a window function, and when every value in a partition is
 -- equal its minimum and maximum are the same value. A hash collision between two
 -- genuinely different bars would keep both rows and fail the test -- a false
 -- alarm rather than a silent pass, which is the correct direction to be wrong in.
-select * from keyed
-qualify
-    equal_null(
-        min(bar_hash) over (partition by price_key),
-        max(bar_hash) over (partition by price_key)
-    )
-    or row_number() over (partition by price_key order by loaded_at desc) = 1
+
+, flagged as (
+
+    select
+        keyed.*,
+        not equal_null(
+            min(bar_hash) over (partition by price_key),
+            max(bar_hash) over (partition by price_key)
+        )                                          as key_was_revised
+
+    from keyed
+
+),
+
+scoped as (
+
+    -- Did ANY key in this source file carry a revision? Every row of the file
+    -- inherits that answer, which is what makes the passengers visible as
+    -- passengers.
+    select
+        flagged.*,
+        max(iff(key_was_revised, 1, 0))
+            over (partition by source_file) = 1    as file_was_revised
+
+    from flagged
+
+),
+
+kept as (
+
+    select * from scoped
+    qualify
+        not file_was_revised
+        or row_number() over (partition by price_key order by loaded_at desc) = 1
+
+)
+
+-- The two flags are working columns, not part of this model's contract.
+select * exclude (key_was_revised, file_was_revised) from kept
