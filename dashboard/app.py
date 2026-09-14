@@ -110,6 +110,20 @@ def _connection():
     )
 
 
+def _fetch_marts() -> pd.DataFrame:
+    """
+    One attempt at the marts query, on whatever connection is cached.
+
+    Split out from load_prices so that the retry there has something to repeat.
+    """
+    cursor = _connection().cursor()
+    try:
+        cursor.execute(MARTS_QUERY)
+        return cursor.fetch_pandas_all()
+    finally:
+        cursor.close()
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Reading the marts layer...")
 def load_prices() -> pd.DataFrame:
     """
@@ -128,20 +142,22 @@ def load_prices() -> pd.DataFrame:
     over a century away.
     """
     try:
-        cursor = _connection().cursor()
-    except Exception:
-        # A cached connection outlives the session Snowflake gave it. Drop the
-        # cached object and let the next call build a fresh one rather than
-        # showing a stack trace to whoever happened to arrive first after the
-        # timeout.
+        frame = _fetch_marts()
+    except connector.errors.DatabaseError:
+        # A cached connection outlives the session Snowflake gave it. The object
+        # stays valid; the token inside it does not. The failure surfaces here,
+        # on execute, because building a cursor is local work that never reaches
+        # the server -- so an earlier version of this guard, which wrapped the
+        # cursor construction, could not fire. The first visitor after an idle
+        # afternoon got 390114 as a stack trace instead.
+        #
+        # Deliberately not narrowed to the expired-token error code. A code list
+        # can be incomplete, and a guard that silently fails to fire is worse
+        # than one that occasionally repeats a query it did not need to. A real
+        # SQL fault fails the same way the second time and is re-raised; the
+        # only cost is one wasted round trip.
         _connection.clear()
-        cursor = _connection().cursor()
-
-    try:
-        cursor.execute(MARTS_QUERY)
-        frame = cursor.fetch_pandas_all()
-    finally:
-        cursor.close()
+        frame = _fetch_marts()
 
     # Snowflake returns identifiers folded to upper case. Fold them back once,
     # here, so that nothing downstream has to remember which case it is in.
