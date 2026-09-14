@@ -228,27 +228,31 @@ def measure(cur, database: str) -> dict:
 
 
 def classify_duplicates(cur, database: str) -> dict:
-    """Split duplicate (ticker, trade_date) keys into the two cases that mean
-    different things.
+    """Split duplicate rows into the two cases that mean different things --
+    asked per SOURCE FILE, because that is the unit Snowflake actually reloads.
 
-    A key whose loads all carry the SAME seven numbers was loaded twice. That is
-    this pipeline's fault -- a file re-copied after the 64-day load history
-    expires, say -- and stopping is right, because nothing downstream can repair
-    it and a green run over it would be a lie.
+    A COPY re-copies a changed file WHOLE, so one revised bar drags every other
+    row in that day file back in unchanged. Classifying per (ticker, trade_date)
+    therefore reported one event as two: on 2026-09-14 a revision on 2026-09-09
+    and 2026-09-10 produced 15 changed keys and 35 unchanged ones, and the 35
+    -- which are not a fault at all -- stopped the pipeline while the 15 only
+    warned. Exactly backwards. Measured, see dup_2026_09_14.
 
-    A key whose loads carry DIFFERENT numbers is the provider revising a bar
-    after the fact. Nothing here is broken, nothing is lost by continuing, and
-    stg_prices keeps the newest load. Stopping the pipeline over it puts a red
-    DAG in front of someone who cannot fix the upstream data anyway -- the same
-    reasoning as the WARN half of the severity rule in dbt/models/_models.yml.
+    So the question is asked of the file: did anything in it change?
 
-    Measured 2026-09-11: the vwap revision that stopped this script produced 25
-    keys in the second category and none in the first.
+    Changed something -> the provider revised a bar it had already published.
+    Nothing here is broken, stg_prices keeps the newest load per key, and a red
+    DAG helps nobody who cannot fix the upstream data. WARN.
+
+    Changed nothing -> the same unchanged file was loaded twice, which is this
+    pipeline's fault (load history expiring after 64 days, say). Nothing
+    downstream repairs it and a green run over it would be a lie. STOP.
     """
     cur.execute(f"""
         WITH loads AS (
             SELECT payload:ticker::string              AS ticker,
                    payload:trade_date::date            AS trade_date,
+                   source_file,
                    HASH(payload:open::float,
                         payload:high::float,
                         payload:low::float,
@@ -265,25 +269,53 @@ def classify_duplicates(cur, database: str) -> dict:
             FROM loads
             GROUP BY 1, 2
             HAVING COUNT(*) > 1
+        ),
+        -- One row per (file, duplicated key). A key that somehow arrived in two
+        -- different files appears under both, which is the honest reading.
+        dup_key_files AS (
+            SELECT DISTINCT l.source_file, k.ticker, k.trade_date,
+                            k.loads, k.distinct_bars
+            FROM loads l
+            JOIN per_key k
+              ON l.ticker = k.ticker AND l.trade_date = k.trade_date
+        ),
+        per_file AS (
+            SELECT source_file,
+                   COUNT(*)                        AS dup_keys,
+                   COUNT_IF(distinct_bars > 1)     AS changed_keys,
+                   SUM(loads - 1)                  AS extra_rows,
+                   MIN(trade_date)                 AS first_day,
+                   MAX(trade_date)                 AS last_day
+            FROM dup_key_files
+            GROUP BY 1
         )
-        SELECT COUNT_IF(distinct_bars = 1)                          AS reloaded_keys,
-               COUNT_IF(distinct_bars > 1)                          AS revised_keys,
-               COALESCE(SUM(IFF(distinct_bars = 1, loads - 1, 0)), 0) AS reloaded_rows,
-               COALESCE(SUM(IFF(distinct_bars > 1, loads - 1, 0)), 0) AS revised_rows,
-               MIN(IFF(distinct_bars > 1, trade_date, NULL))        AS first_revised,
-               MAX(IFF(distinct_bars > 1, trade_date, NULL))        AS last_revised
-        FROM per_key
+        SELECT COUNT_IF(changed_keys = 0)                              AS reloaded_files,
+               COUNT_IF(changed_keys > 0)                              AS revised_files,
+               COALESCE(SUM(IFF(changed_keys = 0, dup_keys, 0)), 0)    AS reloaded_keys,
+               COALESCE(SUM(IFF(changed_keys > 0, dup_keys, 0)), 0)    AS revised_keys,
+               COALESCE(SUM(IFF(changed_keys = 0, extra_rows, 0)), 0)  AS reloaded_rows,
+               COALESCE(SUM(IFF(changed_keys > 0, extra_rows, 0)), 0)  AS revised_rows,
+               COALESCE(SUM(IFF(changed_keys > 0, changed_keys, 0)), 0) AS changed_bars,
+               MIN(IFF(changed_keys > 0, first_day, NULL))             AS first_revised,
+               MAX(IFF(changed_keys > 0, last_day,  NULL))             AS last_revised,
+               MIN(IFF(changed_keys = 0, first_day, NULL))             AS first_reloaded,
+               MAX(IFF(changed_keys = 0, last_day,  NULL))             AS last_reloaded
+        FROM per_file
     """)
     row = cur.fetchone()
     return {
-        "reloaded_keys": row[0],
-        "revised_keys": row[1],
-        "reloaded_rows": row[2],
-        "revised_rows": row[3],
-        "first_revised": str(row[4]) if row[4] else None,
-        "last_revised": str(row[5]) if row[5] else None,
+        "reloaded_files": row[0],
+        "revised_files": row[1],
+        "reloaded_keys": row[2],
+        "revised_keys": row[3],
+        "reloaded_rows": row[4],
+        "revised_rows": row[5],
+        "changed_bars": row[6],
+        "first_revised": str(row[7]) if row[7] else None,
+        "last_revised": str(row[8]) if row[8] else None,
+        "first_reloaded": str(row[9]) if row[9] else None,
+        "last_reloaded": str(row[10]) if row[10] else None,
     }
-
 
 def list_stage(cur, database: str) -> tuple:
     """(file count, total bytes) currently visible under the stage."""
@@ -437,28 +469,35 @@ def run(dry_run: bool, verbose: bool) -> int:
     # number it already published also produces a second row, and on that date
     # one did -- a vwap correction of a hundredth of a cent on seven tickers
     # stopped the whole pipeline. So what happened is established before it is
-    # judged.
+    # judged -- and judged per FILE, because a COPY reloads a changed file whole
+    # and the unchanged rows it drags back in are not a second fault.
     if duplicates:
-        if duplicates["revised_keys"]:
-            print(f"\nWARNING: {duplicates['revised_keys']} "
-                  f"(ticker, trade_date) key(s) have more than one load "
-                  f"carrying DIFFERENT numbers "
-                  f"({duplicates['revised_rows']:,} extra row(s), "
-                  f"{duplicates['first_revised']} -> "
+        if duplicates["revised_files"]:
+            print(f"\nWARNING: {duplicates['revised_files']} file(s) were "
+                  f"reloaded after the provider revised a bar "
+                  f"({duplicates['first_revised']} -> "
                   f"{duplicates['last_revised']}).")
-            print("         The provider revised bars it had already published. "
-                  "stg_prices keeps")
-            print("         the newest load per key; nothing here needs fixing. "
-                  "To see what")
-            print("         changed, compare the loads for one of those days by "
-                  "loaded_at.")
+            print(f"         {duplicates['changed_bars']} bar(s) actually "
+                  f"changed; the reload also brought back")
+            print(f"         {duplicates['revised_keys'] - duplicates['changed_bars']} "
+                  f"unchanged row(s) from the same file(s), because a COPY "
+                  f"re-copies a")
+            print(f"         changed file whole. "
+                  f"{duplicates['revised_rows']:,} extra row(s) in total.")
+            print("         stg_prices keeps the newest load per key; nothing "
+                  "here needs fixing.")
+            print("         To see what changed, compare the loads for one of "
+                  "those days by loaded_at.")
 
-        if duplicates["reloaded_keys"]:
-            die(f"{duplicates['reloaded_keys']} (ticker, trade_date) key(s) "
-                f"have more than one load carrying IDENTICAL numbers "
-                f"({duplicates['reloaded_rows']:,} extra row(s)).",
-                "The same file has been loaded more than once. This is not a "
-                "provider revision -- the bars are unchanged. Compare "
+        if duplicates["reloaded_files"]:
+            die(f"{duplicates['reloaded_files']} file(s) were loaded more than "
+                f"once with NOTHING in them changed "
+                f"({duplicates['reloaded_keys']} key(s), "
+                f"{duplicates['reloaded_rows']:,} extra row(s), "
+                f"{duplicates['first_reloaded']} -> "
+                f"{duplicates['last_reloaded']}).",
+                "The same unchanged file has been loaded twice. This is not a "
+                "provider revision -- no bar in those files differs. Compare "
                 "source_file and loaded_at per (ticker, trade_date) before "
                 "deleting anything.")
 
