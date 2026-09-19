@@ -3,7 +3,8 @@
 #
 #   bash scripts/set_api_key.sh
 #
-# Writes the key to .env and to the macOS Keychain, then verifies both match.
+# Merges the key into .env and writes it to the macOS Keychain, then verifies
+# both match. Other variables already in .env are preserved.
 # The key is never printed to the screen and never enters shell history:
 #   - `read -s` takes it as INPUT, not as a command, so ~/.zsh_history never sees it
 #   - -s suppresses echo, so the terminal never draws it -- screenshots are safe
@@ -43,8 +44,19 @@ if [ "${#NEWKEY}" -lt 20 ] || [ "${#NEWKEY}" -gt 60 ]; then
   exit 1
 fi
 
-# --- .env ---
-printf '# Real key -- gitignored. See .env.example for the template.\n%s=%s\n' "$VAR" "$NEWKEY" > .env
+# --- .env: merge, never clobber ---
+# This USED TO BE a plain `> .env` redirect, written when POLYGON_API_KEY was the
+# only thing in the file. By 2026-09-19 .env also held AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION and S3_BUCKET -- so the one script
+# whose whole job is rotating a key safely would have silently deleted the four
+# credentials upload_to_s3.py needs, and the failure would have surfaced at the
+# next 07:00 DAG run rather than here. set_aws_keys.sh already merged for exactly
+# this reason and said so in its header. Now both do. Do not "simplify" this back.
+touch .env
+TMP="$(mktemp)"
+grep -v -E "^${VAR}=" .env > "$TMP" || true
+printf '%s=%s\n' "$VAR" "$NEWKEY" >> "$TMP"
+mv "$TMP" .env
 chmod 600 .env
 
 # --- Keychain ---
